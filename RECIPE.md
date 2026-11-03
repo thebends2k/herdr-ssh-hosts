@@ -6,7 +6,7 @@ An **SSH** row in the sidebar that opens a searchable list of the hosts in your 
 
 ## What you see
 
-**The sidebar row.** A block 32 px high (fixed: `min` and `max` are 32 too) with, left to right: a terminal icon, the word `SSH`, the number of hosts (10 px, dimmed, filling the free space), and a right chevron. Text is 12 px, on the theme's `chrome` background; on hover the background becomes `hover` and the text `foreground`.
+**The sidebar row.** A block 32 px high (fixed: `min` and `max` are 32 too) with, left to right: a terminal icon, the word `SSH`, the number of hosts (10 px, dimmed, filling the free space), and a right chevron. When the row is narrower than 120 px (a collapsed sidebar) it shows only the centered terminal icon, with an `SSH hosts` tooltip. Text is 12 px, on the theme's `chrome` background; on hover the background becomes `hover` and the text `foreground`.
 
 **The picker popup** (click the row). 360 px wide; its height fits its content, never less than 220 px or more than 560 px. Top to bottom:
 

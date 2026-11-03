@@ -13,7 +13,7 @@ const icon = name => svg('mods/ssh-hosts/' + name + '.svg').w(16).h(16).flex_non
 // Kept in shared state: unlike localStorage it lasts across popups and restarts.
 const recall = (key, fallback) => shared('ssh-hosts.' + key) ?? fallback;
 const remember = (key, value) => setShared('ssh-hosts.' + key, value);
-const ROW = 40, HEAD = 26, WIDTH = 360;
+const ROW = 40, HEAD = 26, WIDTH = 360, COMPACT = 120;
 
 export default class SSHHosts extends View {
   init(initial, cx) {
@@ -242,17 +242,26 @@ export default class SSHHosts extends View {
     if (this.sftp) return this.sftp.render(cx);
     const t = theme();
     if (!this.popup) {
-      return h_flex().id('ssh-open').size_full().px(16).gap(8).items_center()
-        .bg(t.chrome).text_size(12).text_color(t.muted)
+      // A collapsed sidebar is narrow: show only the icon, centered, with a tooltip.
+      const compact = this.rowWidth != null && this.rowWidth < COMPACT;
+      return h_flex().id('ssh-open').size_full().gap(8).items_center().overflow_hidden()
+        .when(compact, el => el.justify_center().tooltip('SSH hosts')).when(!compact, el => el.px(16))
+        .bg(t.chrome).text_size(12).text_color(t.muted).role('button').accessibility_label('SSH')
         .hover(s => s.bg(t.hover).text_color(t.foreground))
+        .on_size_change((size, cx) => {
+          const was = this.rowWidth != null && this.rowWidth < COMPACT;
+          this.rowWidth = size.width;
+          if (was !== size.width < COMPACT) cx.notify();
+        })
         .on_click(() => {
           // A popup takes its content's size: the list, which only fills space, needs a set height.
           const height = SSHHosts.height(this.hosts);
           openOverlay({ mod: 'ssh-hosts', props: { popup: true, height }, kind: 'popup', width: WIDTH, height });
         })
-        .child(icon('terminal')).child('SSH')
-        .child(div().flex_1().text_size(10).text_color(t.dim).child(String(this.hosts.length)))
-        .child(icon('chevron-right'));
+        .child(icon('terminal'))
+        .when(!compact, el => el.child('SSH')
+          .child(div().flex_1().text_size(10).text_color(t.dim).child(String(this.hosts.length)))
+          .child(icon('chevron-right')));
     }
     const list = this.list(t);
     if (this.cursor >= this.rows.length) this.cursor = Math.max(0, this.rows.length - 1);
