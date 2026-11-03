@@ -134,4 +134,4 @@ number of hosts. Clicking it opens a popup list, sized to its content:
   space; if there is none, an **SSH** space is created. The password, if needed,
   is typed in the terminal; the picker never stores it.
 
-Requirements: OpenSSH on the PATH and a local ~/.ssh/config. No configurations or credentials are included. The mod does not enumerate Include files. How to add it to a layout: see `RECIPE.md` in the repository.
+Requirements: OpenSSH on the PATH and a local ~/.ssh/config. No configurations or credentials are included. The mod does not enumerate Include files. Installation and how to add it to a layout: see the README at the repository root.
