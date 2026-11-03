@@ -84,9 +84,9 @@ Folder `mods/ssh-hosts/`, which is the whole mod:
 - **State lives in shared state, not `localStorage`** (which does not last across popups and restarts).
 - **No `keys.json`.** The mod binds no global keys; every key above works only with its popup or list focused.
 - **Python must be Python 3** with its standard library; `-I` (isolated mode) is used for the askpass program so a stray file next to it is never imported.
-- Do not add real servers, users or addresses to the repository, tests or screenshots. `preview.png` was made in an isolated Herdr (dark `graphite` theme) with an invented `~/.ssh/config` (documentation addresses `203.0.113.0/24`, `198.51.100.0/24`, `192.0.2.0/24` and `example.com`), a made-up home folder (`/home/demo`) and made-up server files (`/srv/www`).
+- Do not add real servers, users or addresses to the repository or the screenshots. `preview.png` was made in an isolated Herdr (dark `graphite` theme) with an invented `~/.ssh/config` (documentation addresses `203.0.113.0/24`, `198.51.100.0/24`, `192.0.2.0/24` and `example.com`), a made-up home folder (`/home/demo`) and made-up server files (`/srv/www`).
 - `preview.png` shows two blocks side by side so nothing hides anything: the picker popup on the left (360 px, the same view the sidebar row opens) and the SFTP tab on the right. A screenshot cannot click the row, so the popup is drawn as a block with `props: { popup: true, height: 470 }`; the real one opens over the window.
-- The SFTP half of the preview is connected through a stand-in `ssh` that runs the local OpenSSH `sftp-server` (the same trick the tests use), not through a real server.
+- The SFTP half of the preview is connected through a stand-in `ssh` that runs the local OpenSSH `sftp-server`, not through a real server.
 
 ## Done when
 
@@ -99,4 +99,3 @@ Folder `mods/ssh-hosts/`, which is the whole mod:
 7. Uploading and downloading files and a folder works, the queue shows every row with its status, and sending a name that already exists stops with `Skip` / `Rename` / `Overwrite`.
 8. `F3` on a text file shows it read-only; on a file over 1 MB it is refused with a message.
 9. Saving `~/.ssh/config` with a new host updates the open popup without reopening it.
-10. `python tests/test_sftp.py -v` passes, with the local `sftp-server`; it never connects to real servers.

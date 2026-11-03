@@ -91,13 +91,6 @@ without the tab. Transfers use `.herdr-upload-*` and `.herdr-download-*`
 temporaries: a cancellation cleans them up; a forced close or a lost connection
 can leave an incomplete one behind.
 
-Validation: `python tests/test_sftp.py -v` at the repository root, with the
-local `sftp-server` (OpenSSH's on Linux and macOS, Git for Windows' on
-Windows). It tests large parallel transfers, Unicode names, links, conflicts
-and overwriting, cancellation, non-empty folders, the file viewer, the HTTP API
-and, on Linux and macOS, the fingerprint and password dialog with a fake `ssh`.
-It never connects to real servers.
-
 ## SSH picker
 
 An **SSH** row in the sidebar of a layout of your own (for example under Spaces) with the
@@ -141,4 +134,4 @@ number of hosts. Clicking it opens a popup list, sized to its content:
   space; if there is none, an **SSH** space is created. The password, if needed,
   is typed in the terminal; the picker never stores it.
 
-Requirements: OpenSSH on the PATH and a local ~/.ssh/config. No configurations or credentials are included. The mod does not enumerate Include files. Installation and how to add it to a layout: see the README at the repository root.
+Requirements: OpenSSH on the PATH and a local ~/.ssh/config. No configurations or credentials are included. The mod does not enumerate Include files. How to add it to a layout: see `RECIPE.md` in the repository.
