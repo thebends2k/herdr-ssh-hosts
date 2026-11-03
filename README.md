@@ -26,7 +26,7 @@ It installs no packages or services, and it never stores passwords.
 First read `~/.config/herdr-app/AGENTS.md`: Herdr rewrites it with the rules of its version.
 
 ```sh
-git clone <repository-url> herdr-ssh-hosts
+git clone https://github.com/thebends2k/herdr-ssh-hosts.git
 cp -R herdr-ssh-hosts/mods/ssh-hosts ~/.config/herdr-app/mods/
 herdr-app check ~/.config/herdr-app/mods/ssh-hosts
 ```
