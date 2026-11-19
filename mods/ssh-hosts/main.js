@@ -2,7 +2,7 @@ import { View, div, svg } from 'gpui-kit';
 import { v_flex, h_flex, Input, InputState } from 'gpui-base';
 import { checking, closeOverlay, exec, focused, openOverlay, panes, placement, props, readTextFile, run, setShared, shared, spaces, theme, watchFolder, window } from 'herdr';
 import { parseConfig, groupHosts, target, launchPlan } from './config.js';
-import { CONFIG, liveStatus, rememberSession, sessions, setMode, shellArgv, tabState } from './session.js';
+import { CONFIG, hidePanel, liveStatus, panelPath, panelShown, rememberSession, sessions, setMode, shellArgv, showPanel, tabState } from './session.js';
 import { SftpPanel } from './sftp.js';
 
 // One mod, five faces, chosen by its props:
@@ -10,6 +10,7 @@ import { SftpPanel } from './sftp.js';
 //   { auth: {...} }   the sign-in dialog the SFTP pane opens for OpenSSH's questions
 //   { bar: true }     the floating pill: SFTP status and SSH / Split / SFTP
 //   popup             the host picker (from the row, a tab bar button or `mod.open`)
+//   { panel: true }   the same picker as a side panel, in a layout that holds one
 //   (none)            the 32 px SSH row for a sidebar
 
 const icon = (name, size = 16) => svg('mods/ssh-hosts/' + name + '.svg').w(size).h(size).flex_none();
@@ -29,10 +30,18 @@ export default class SSHHosts extends View {
     }
     if (p.auth) return this.initAuth(p.auth);
     if (p.bar) { this.bar = true; return; }
+    // The shortcut (`mod.open`) opens an overlay; with a side panel in the
+    // layout, show that instead and close the overlay at once.
+    if (p.overlay && !p.popup && showPanel()) {
+      this.redirected = true;
+      closeOverlay(p.overlay);
+      return;
+    }
+    this.panel = Boolean(p.panel);
     this.path = CONFIG();
     this.folder = this.path.replace(/[\\/]config$/, '');
     // `mod.open ssh-hosts` (a key) opens it as an overlay too, without `popup`.
-    this.popup = Boolean(p.popup || p.overlay);
+    this.popup = Boolean(p.popup || p.overlay || p.panel);  // the picker, in a popup or a panel
     this.hosts = [];
     this.error = null;
     this.loading = true;
@@ -56,7 +65,7 @@ export default class SSHHosts extends View {
       });
       this.query = '';
       this.cursor = 0;
-      this.search.focus();
+      if (!this.panel) this.search.focus();
     }
   }
 
@@ -263,8 +272,10 @@ export default class SSHHosts extends View {
     return Math.max(220, Math.min(560, 52 + 36 + heads * (HEAD + 8) + rows * ROW + 16));
   }
 
-  // Opens the picker as a popup under the pointer (the row and tab bar buttons).
+  // Opens the picker: the layout's side panel if it has one, else a popup
+  // under the pointer (the row and tab bar buttons).
   static openPicker() {
+    if (showPanel()) return;
     const height = Number(shared('ssh-hosts.popupHeight')) || 420;
     openOverlay({ mod: 'ssh-hosts', props: { popup: true, height }, kind: 'popup', width: WIDTH, height });
   }
@@ -298,7 +309,9 @@ export default class SSHHosts extends View {
           .on_mouse_down('left', (_e, cx) => cx.stop_propagation())
           .on_click((_e, cx) => { cx.stop_propagation(); this.togglePin(alias, cx); })
           .child(pinned ? '★' : '☆')))
-      .when(!chosen && pinned, el => el.child(div().text_color(t.dim).child('★')));
+      // Same 26 px box as the button: the star never moves when the row is hovered.
+      .when(!chosen && pinned, el => el.child(h_flex().w(26).h(26).flex_none().items_center().justify_center()
+        .text_color(t.dim).child('★')));
   }
 
   list(t) {
@@ -378,8 +391,17 @@ export default class SSHHosts extends View {
       .child(status_).child(div().w(1).h(12).bg(t.border)).children(buttons);
   }
 
+  // The panel takes the keyboard when it appears, or when asked again.
+  focusPanel() {
+    const shown = panelShown(), asked = shared('ssh-hosts.focusPanel') ?? 0;
+    if (shown && (!this.wasShown || asked !== this.asked)) this.search.focus();
+    this.wasShown = shown;
+    this.asked = asked;
+  }
+
   render(cx) {
     if (this.sftp) return this.sftp.render(cx);
+    if (this.redirected) return div();
     const t = theme();
     if (this.auth) return this.renderAuth(t);
     if (this.bar) return this.renderBar(t);
@@ -403,8 +425,20 @@ export default class SSHHosts extends View {
     }
     const list = this.list(t);
     if (this.cursor >= this.rows.length) this.cursor = Math.max(0, this.rows.length - 1);
-    return v_flex().id('ssh-popup').w(WIDTH).h(props()?.height ?? 420).min_h(0).bg(t.chrome).text_size(12)
+    if (this.panel) this.focusPanel();
+    // In a panel, like Files: a card filling the block, with a titled header.
+    const frame = this.panel
+      ? v_flex().id('ssh-panel').size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background)
+        .border_1().border_color(t.border).text_color(t.foreground).text_size(12)
+        .child(h_flex().h(42).flex_none().px(14).gap(8).items_center().border_b(1).border_color(t.border)
+          .child(div().font_semibold().text_size(13).child('SSH'))
+          .child(div().flex_1().min_w(0).truncate().text_right().text_color(t.dim)
+            .child(this.loading ? '' : `${this.hosts.length} host${this.hosts.length === 1 ? '' : 's'}`)))
+      : v_flex().id('ssh-popup').w(WIDTH).h(props()?.height ?? 420).min_h(0).bg(t.chrome).text_size(12);
+    const close = () => this.panel ? hidePanel() : this.done();
+    return frame
       .on_key_down((e, cx) => {
+        if (e.key === 'escape' && this.panel) { hidePanel(); cx.stop_propagation(); return; }
         const moves = { up: -1, down: 1 };
         if (!(e.key in moves) || !this.rows.length) return;
         this.cursor = (this.cursor + moves[e.key] + this.rows.length) % this.rows.length;
@@ -415,8 +449,8 @@ export default class SSHHosts extends View {
         .child(Input.new(this.search).h(32).px(10).flex_1().min_w(0).rounded(6).border_1().border_color(t.input)
           .bg(t.background).text_color(t.foreground).text_size(12).accessibility_label('Search host'))
         .child(h_flex().id('ssh-close').w(32).h(32).flex_none().items_center().justify_center().rounded(6).text_color(t.muted)
-          .tooltip('Close (Esc)').accessibility_label('Close')
-          .hover(s => s.bg(t.hover).text_color(t.foreground)).on_click(() => this.done()).child(icon('close'))))
+          .tooltip(this.panel ? 'Close the panel (Esc)' : 'Close (Esc)').accessibility_label('Close')
+          .hover(s => s.bg(t.hover).text_color(t.foreground)).on_click(close).child(icon('close'))))
       .child(list)
       .child(h_flex().h(36).flex_none().px(14).gap(8).items_center().border_t_1().border_color(t.border).text_size(11).text_color(t.dim)
         .child(div().flex_1().truncate().child('Enter open · Ctrl+Enter another session'))

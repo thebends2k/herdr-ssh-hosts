@@ -161,7 +161,10 @@ can leave an incomplete one behind.
 
 Opens with **Ctrl+Shift+H** (`mod.open:ssh-hosts`, see the repository's
 README), from an optional **SSH** row in a sidebar, or from a button in a tab
-bar of your own:
+bar of your own. If the layout holds it as a **side panel** (a block with
+`"props": { "panel": true }`, next to Files and Changes), all of them open the
+panel instead of the popup; it stays open while you open hosts, and Esc or ×
+closes it:
 
 - **Search** on top, with the cursor already in it: it filters by alias, host,
   user or group. ↑ ↓ choose; **Enter** opens the host's tab (or goes to it),

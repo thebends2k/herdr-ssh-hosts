@@ -54,6 +54,14 @@ Herdr's shipped layouts are read-only, so clone one first: `herdr-app do layout.
   { "id": "ssh-hosts", "type": "block", "content": { "mod": "ssh-hosts" }, "size": { "px": 32 }, "min": 32, "max": 32 }
   ```
 
+- **Side panel**, like Files and Changes: add the picker as one more child of the right panel's stack (in `main`, `panel-body`). The SSH button and **Ctrl+Shift+H** then open it there instead of the popup, and it stays open while you open hosts (Esc or × closes it):
+
+  ```json
+  { "id": "ssh", "type": "block", "content": { "mod": "ssh-hosts", "props": { "panel": true } } }
+  ```
+
+  A tab bar button shows it with `layout.select {stack: "panel-body", child: "ssh"}` + `layout.show {id: "panel"}`, as it does for Files.
+
 - **Floating pill** (status + SSH / Split / SFTP), on the block that shows the tab (`"tab": "active"`). It only draws on host tabs and can be dragged:
 
   ```json

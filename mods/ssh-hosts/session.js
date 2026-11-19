@@ -4,7 +4,7 @@
 // The terminal does not run ssh directly but `sftp_bridge.py shell`, which
 // waits until the SFTP pane has signed in (one password or fingerprint for
 // both) and then runs ssh over that same connection.
-import { appHome, home, panes, run, setShared, shared, spaces, window } from 'herdr';
+import { appHome, home, layout, panes, run, setShared, shared, spaces, window } from 'herdr';
 
 export const WINDOWS = () => window()?.platform === 'windows';
 export const PYTHON = () => WINDOWS() ? 'python' : 'python3';
@@ -102,4 +102,56 @@ export function setMode(next, state, cx) {
   } else if (state.alias) {
     addSsh(state, true, cx);
   }
+}
+
+// --- the optional side panel ---------------------------------------------------
+// A layout may hold the picker as a block `{ mod: 'ssh-hosts', props: { panel: true } }`,
+// like Files and Changes (a child of the right panel's stack). Then the shortcut
+// and the buttons show it instead of the popup. Without one, nothing changes.
+
+function pathTo(node, trail = []) {
+  if (!node || typeof node !== 'object') return null;
+  const here = [...trail, node];
+  if (node.content?.mod === 'ssh-hosts' && node.content?.props?.panel) return here;
+  for (const child of node.children ?? []) {
+    const found = pathTo(child, here);
+    if (found) return found;
+  }
+  return null;
+}
+
+// Root → … → the panel block, or null when the shown layout has none.
+export const panelPath = () => pathTo(layout());
+
+export function panelShown(path = panelPath()) {
+  return Boolean(path) && path.every((node, i) => !node.hidden
+    && (path[i - 1]?.type !== 'stack' || path[i - 1].active === node.id));
+}
+
+export function showPanel(path = panelPath()) {
+  if (!path) return false;
+  // Select first, then show: the panel never flashes another child (as Files does).
+  path.forEach((node, i) => {
+    const parent = path[i - 1];
+    if (parent?.type === 'stack' && parent.active !== node.id) run('layout.select', { stack: parent.id, child: node.id });
+  });
+  for (const node of path) if (node.hidden) run('layout.show', { id: node.id });
+  // The panel's search box takes the keyboard (the panel watches this).
+  setShared('ssh-hosts.focusPanel', Date.now());
+  return true;
+}
+
+// Hides what holds the panel: the nearest sized node above it (the right panel).
+export function hidePanel(path = panelPath()) {
+  const holder = path && [...path].reverse().find((node, i) => i > 0 && node.size && node.id);
+  if (holder) run('layout.hide', { id: holder.id });
+}
+
+// The picker's button: toggles the side panel if the layout has one (false if not).
+export function togglePanel() {
+  const path = panelPath();
+  if (!path) return false;
+  if (panelShown(path)) hidePanel(path);
+  else showPanel(path);
+  return true;
 }
