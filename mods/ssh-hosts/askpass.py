@@ -1,7 +1,8 @@
 """SSH_ASKPASS for the SFTP view: OpenSSH runs this (through askpass.sh or
 askpass.cmd) when it needs a password, a key passphrase or a host-key
-decision. It hands the question to the worker that started ssh and prints
-the answer the person gave in Herdr's dialog. Nothing is stored.
+decision. It hands the question to the worker that started ssh (or, for a
+Windows terminal, HERDR_SFTP_REPLAY, the worker whose sign-in it reuses) and
+prints the answer the person gave in Herdr's dialog. Nothing is stored.
 """
 import json
 import os
@@ -25,7 +26,8 @@ def main():
     else:
         kind = 'secret'
     request = urllib.request.Request(url + '/askpass', method='POST',
-                                     data=json.dumps(dict(prompt=prompt, kind=kind)).encode(),
+                                     data=json.dumps(dict(prompt=prompt, kind=kind,
+                                                         replay=os.environ.get('HERDR_SFTP_REPLAY') == '1')).encode(),
                                      headers={'Authorization': 'Bearer ' + token,
                                               'Content-Type': 'application/json'})
     # Loopback only: never through a proxy from the environment.

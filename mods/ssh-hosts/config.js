@@ -20,7 +20,7 @@ export function parseConfig(text) {
     const line = raw.trim();
     if (!line) { heading = null; continue; }
     if (line.startsWith('#')) { heading = line.replace(/^#+\s*/, '').trim() || null; continue; }
-    const host = line.match(/^Host(?:\s+|\s*=\s*)(.+)$/i);
+    const host = line.match(/^Host(?:\s*=\s*|\s+)(.+)$/i);
     if (host) {
       if (heading && heading.length <= 40) group = heading;
       heading = null;
@@ -38,7 +38,7 @@ export function parseConfig(text) {
     }
     heading = null;
     if (/^Match(?:\s|=)/i.test(line)) { block = []; wildcard = false; continue; }
-    const option = line.match(/^([A-Za-z]+)(?:\s+|\s*=\s*)(.+)$/);
+    const option = line.match(/^([A-Za-z]+)(?:\s*=\s*|\s+)(.+)$/);
     const key = option && SHOWN[option[1].toLowerCase()];
     if (!key) continue;
     // As in OpenSSH, the first value given for a host wins.
@@ -72,9 +72,9 @@ export function target(entry) {
   return `${entry.user ? entry.user + '@' : ''}${entry.host ?? entry.alias}${entry.port ? ':' + entry.port : ''}`;
 }
 
-export function launchPlan(alias, configPath, localSpaces) {
+// Where a host's tab opens: the active local space, else one named SSH, else a new one.
+export function launchPlan(alias, argv, localSpaces) {
   if (!ALIAS.test(alias)) throw new Error('Invalid SSH alias');
-  const argv = ['ssh', '-F', configPath, alias];
   const space = localSpaces.find(s => s.active) ?? localSpaces.find(s => s.name === 'SSH') ?? localSpaces[0];
   return space
     ? { command: 'tab.new', args: { space: space.id, name: alias, argv } }

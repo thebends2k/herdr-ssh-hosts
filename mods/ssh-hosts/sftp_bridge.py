@@ -30,6 +30,8 @@ NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 CHUNK = 32768        # bytes per SFTP read/write request (OpenSSH's own size)
 WINDOW = 64          # requests in flight per transfer: ~2 MB, like OpenSSH sftp
 MAX_ENTRIES = 20000  # per listing
+MAX_JOBS = 100000    # items in the queue
+MAX_DEPTH = 64       # folder levels in one transfer
 IDLE = 90            # seconds without the view before the worker exits
 
 # SFTP v3 packet types
@@ -314,7 +316,11 @@ class SFTP:
 
     # --- transfers (pipelined: up to WINDOW requests in flight) -----------
 
-    def upload(self, local, remote, progress, cancelled, overwrite=False):
+    def upload(self, local, remote, progress, cancelled, overwrite=False, follow=True):
+        # Inside an uploaded folder links are not followed: a link to
+        # ~/.ssh/id_ed25519 in a cloned project must never reach the server.
+        if not follow and os.path.islink(local):
+            raise ValueError('Link: not followed')
         if not Path(local).is_file():
             raise ValueError('Choose a local file, not a folder')
         existing = self.exists(remote)
@@ -330,7 +336,8 @@ class SFTP:
         handle = self.request(OPEN, string(temporary) + u32(2 | 8 | 32) + u32(4) + u32(mode), HANDLE).str()
         pending, failure, complete = collections.deque(), None, False
         try:
-            with open(local, 'rb') as source:
+            flags = os.O_RDONLY | getattr(os, 'O_BINARY', 0) | (0 if follow else getattr(os, 'O_NOFOLLOW', 0))
+            with os.fdopen(os.open(local, flags), 'rb') as source:
                 total = os.fstat(source.fileno()).st_size
                 offset = done = 0
                 finished = False
@@ -375,13 +382,13 @@ class SFTP:
                 except Exception:
                     pass
 
-    def download(self, remote, local, progress, cancelled, overwrite=False):
+    def download(self, remote, local, progress, cancelled, overwrite=False, limit=None):
         attrs = self.stat(remote)  # follows links: a link to a file downloads the file
         if not stat.S_ISREG(attrs.get('mode', 0)):
             raise ValueError('Only files are downloaded, not folders')
         target = Path(local)
         if os.name == 'nt' and (any(c in target.name for c in '<>:"|?*') or target.name.endswith((' ', '.'))
-                               or re.fullmatch(r'(?i)(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?', target.name)):
+                               or re.fullmatch(r'(?i)(CON|PRN|AUX|NUL|COM[0-9\u00b9\u00b2\u00b3]|LPT[0-9\u00b9\u00b2\u00b3])(?:\..*)?', target.name)):
             raise ValueError('This name is not valid on Windows. Rename the file before downloading it.')
         if os.path.lexists(target):
             if not overwrite:
@@ -424,6 +431,12 @@ class SFTP:
                     data = result.str()
                     if not data:
                         eof_at = offset if eof_at is None else min(eof_at, offset)
+                        continue
+                    if len(data) > length:  # a hostile server: more than asked for
+                        failure = failure or ValueError('The server sent more data than requested')
+                        continue
+                    if limit is not None and offset + len(data) > limit:
+                        failure = failure or ValueError(f'The file is larger than {limit // 1024} KB')
                         continue
                     output.seek(offset)
                     output.write(data)
@@ -488,9 +501,131 @@ def askpass_program():
     return str(program)
 
 
-def ssh_command(alias, config, url=None, token=None):
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', alias):
+# --- one sign-in for SSH and SFTP ------------------------------------------
+# Linux and macOS: the first ssh of a host (the SFTP pane's, normally) becomes
+# an OpenSSH ControlMaster that outlives it for a while (ControlPersist); the
+# terminal's ssh and later SFTP panes ride on it without asking again.
+# Windows' OpenSSH has no ControlMaster: there the worker keeps the password
+# typed in its dialog in memory, for this session only, and hands it to the
+# terminal's ssh through askpass (HERDR_SFTP_REPLAY). Nothing touches disk.
+#
+# Each worker also writes <runtime>/<alias>.json (state, url, token, a heartbeat)
+# so the terminal (`shell`) knows when the sign-in is done.
+
+MUX = os.name != 'nt'
+PERSIST = '120'      # seconds the master stays after its last session closes
+BEAT = 2             # seconds between session-file heartbeats
+STALE = 3 * BEAT + 1
+REPLAY_TTL = 120     # Windows: seconds the terminal has to use the typed password
+
+
+def check_alias(alias):
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]*', alias or ''):
         raise ValueError('Invalid SSH alias')
+    return alias
+
+
+def runtime_dir():
+    """Private to this user. Short on purpose: a socket path has ~100 bytes."""
+    if os.name == 'nt':
+        # %LOCALAPPDATA% is the user's own (a shared C:\\Temp would not be).
+        folder = Path(os.environ.get('LOCALAPPDATA') or tempfile.gettempdir()) / 'herdr-ssh'
+    else:
+        base = os.environ.get('XDG_RUNTIME_DIR')
+        folder = Path(base) / 'herdr-ssh' if base and os.path.isdir(base) else Path('/tmp') / f'herdr-ssh-{os.getuid()}'
+    folder.mkdir(mode=0o700, exist_ok=True)
+    if os.name != 'nt':
+        info = folder.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise RuntimeError(f'{folder} is not a private folder of this user')
+        if info.st_mode & 0o077:
+            folder.chmod(0o700)
+    return folder
+
+
+def mux_options():
+    if not MUX:
+        return []
+    return ['-o', 'ControlMaster=auto', '-o', f'ControlPath={runtime_dir()}/cm-%C', '-o', f'ControlPersist={PERSIST}']
+
+
+def session_file(alias):
+    return runtime_dir() / f'{check_alias(alias)}.json'
+
+
+def write_session(alias, **info):
+    path = session_file(alias)
+    temporary = path.with_name(f'.{path.name}.{os.getpid()}')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as file:
+        json.dump(dict(info, pid=os.getpid(), beat=time.time()), file)
+    os.replace(temporary, path)
+
+
+def read_session(alias):
+    try:
+        info = json.loads(session_file(alias).read_text())
+    except (OSError, ValueError):
+        return None
+    return info if time.time() - info.get('beat', 0) < STALE else None
+
+
+def drop_session(alias):
+    """Removes the session file if it is this process's."""
+    try:
+        path = session_file(alias)
+        if json.loads(path.read_text()).get('pid') == os.getpid():
+            path.unlink()
+    except (OSError, ValueError):
+        pass
+
+
+def config_args(config):
+    """`-F <config>` only for a file other than ~/.ssh/config: with -F, OpenSSH
+    skips the system's /etc/ssh/ssh_config (crypto policies, known_hosts hashing…)."""
+    default = os.path.expanduser(os.path.join('~', '.ssh', 'config'))
+    same = os.path.normcase(os.path.abspath(config)) == os.path.normcase(os.path.abspath(default))
+    return [] if same else ['-F', config]
+
+
+def kbd_args():
+    """Windows: askpass.cmd goes through cmd.exe, which cannot quote arbitrary text
+    safely, and keyboard-interactive prompts are written by the server. Without it,
+    every prompt reaching askpass is OpenSSH's own (password, passphrase, host key)."""
+    return ['-o', 'KbdInteractiveAuthentication=no'] if os.name == 'nt' else []
+
+
+def strict_option(alias, config):
+    """`ask` (never weaker), unless the person's config already says `yes`."""
+    try:
+        out = subprocess.run(['ssh'] + config_args(config) + ['-G', alias], capture_output=True, text=True,
+                             timeout=10, stdin=subprocess.DEVNULL, creationflags=NO_WINDOW).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        out = ''
+    if re.search(r'(?mi)^stricthostkeychecking (yes|true)$', out):
+        return []
+    return ['-o', 'StrictHostKeyChecking=ask']
+
+
+# What OpenSSH itself asks. Anything else (keyboard-interactive, prefixed
+# "(user@host) " by OpenSSH) is the server's text and is shown as such.
+SERVER_PROMPT = re.compile(r'^\([^()\s]+@[^()\s]+\) ')
+HOSTKEY_PROMPT = re.compile(r"(?m)^(The authenticity of host '|Warning: the \S+ host key for ')")
+PASSPHRASE_PROMPT = re.compile(r"^Enter passphrase for (key '|\")")
+
+
+def classify(text, kind):
+    if SERVER_PROMPT.match(text):
+        return 'server'
+    if kind == 'hostkey':
+        return 'hostkey' if HOSTKEY_PROMPT.search(text) else 'server'
+    if kind == 'secret' and PASSPHRASE_PROMPT.match(text):
+        return 'passphrase'
+    return kind
+
+
+def ssh_command(alias, config, url=None, token=None):
+    check_alias(alias)
     env = os.environ.copy()
     if url:
         # Passwords, passphrases and host-key questions go to the view's dialog.
@@ -499,10 +634,10 @@ def ssh_command(alias, config, url=None, token=None):
         if os.name == 'nt':
             env.setdefault('DISPLAY', ':0')
     # Never disable host-key verification or save a password. Config supplies jumps/keys.
-    argv = ['ssh', '-F', config, '-T', '-o', 'StrictHostKeyChecking=ask',
+    argv = ['ssh'] + config_args(config) + ['-T'] + (strict_option(alias, config) if url else ['-o', 'StrictHostKeyChecking=ask']) + kbd_args() + [
             '-o', 'ConnectTimeout=20', '-o', 'ServerAliveInterval=15',
             '-o', 'ServerAliveCountMax=3', '-o', 'ForwardAgent=no',
-            '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no']
+            '-o', 'ClearAllForwardings=yes', '-o', 'PermitLocalCommand=no'] + mux_options()
     if not url:
         argv += ['-o', 'BatchMode=yes']
     return argv + ['-s', alias, 'sftp'], env
@@ -531,6 +666,26 @@ def safe_name(name):
     if not isinstance(name, str) or not name or name in ('.', '..') or any(c in name for c in '/\\\x00\r\n'):
         raise ValueError('Type a plain name, without slashes or line breaks')
     return name
+
+
+WINDOWS_DEVICES = {'CON', 'PRN', 'AUX', 'NUL', 'CONIN$', 'CONOUT$',
+                   *(f'{port}{n}' for port in ('COM', 'LPT') for n in '0123456789\u00b9\u00b2\u00b3')}
+
+
+def local_child(folder, name):
+    """`folder/name` on this computer, for a name that may come from the server.
+    A hostile server must not write outside the folder: on Windows a backslash,
+    a drive (`C:x`), a stream (`x:y`), a device name (`NUL.txt`) or a trailing
+    dot or space all mean something else than a plain name."""
+    safe_name(name)
+    if os.name == 'nt' and (':' in name or name != name.rstrip(' .')
+                            or name.split('.')[0].upper().rstrip(' ') in WINDOWS_DEVICES
+                            or any(ord(c) < 32 or c in '<>"|?*' for c in name)):
+        raise ValueError(f'“{name}” is not a valid file name on Windows')
+    path = os.path.join(folder, name)
+    if os.path.dirname(os.path.abspath(path)) != os.path.abspath(folder):
+        raise ValueError(f'“{name}” is not a plain name')
+    return path
 
 
 # --- this computer's files (the local panel) -----------------------------
@@ -633,6 +788,11 @@ class Worker:
         self.last_seen = time.monotonic()
         self.client = None
         self.answers = {}  # prompt id -> [Event, answer]
+        # Windows only (no ControlMaster): what was typed while signing in,
+        # kept for the terminal's ssh once it worked: handed over once, and
+        # forgotten after REPLAY_TTL seconds anyway. Memory only.
+        self.typed, self.secrets = {}, {}  # prompt -> answer / (answer, since)
+        self.phase = 'connecting'  # for the session file: connecting, ready, failed
         self.jobs, self.batches, self.current, self.asking = [], {}, None, None
         self.listing = dict(path='.', entries=[], limited=False)
         self.local = dict(path=None, entries=[], limited=False)
@@ -754,18 +914,36 @@ class Worker:
 
     # --- askpass -----------------------------------------------------------
 
-    def ask(self, text, kind):
+    def publish(self, phase=None):
+        """Writes the session file the terminal's `shell` waits on (and the heartbeat)."""
+        if phase:
+            self.phase = phase
+        if self.stop.is_set() or not self.url:
+            return
+        try:
+            write_session(self.alias, state=self.phase, url=self.url, token=self.token)
+        except OSError:
+            pass
+
+    def ask(self, text, kind, replay=False):
         """Called from askpass.py's request: blocks until the view answers."""
         if self.stop.is_set():
             return None
+        text = text.strip()
+        kind = classify(text, kind)
+        secret = kind in ('secret', 'passphrase')
+        if replay and secret and text in self.secrets:
+            answer, since = self.secrets.pop(text)
+            if time.monotonic() - since < REPLAY_TTL:
+                return answer
         number = secrets.token_hex(8)
         slot = [threading.Event(), None]
         self.answers[number] = slot
-        if kind == 'secret' and re.search(r'(?i)passphrase', text):
-            kind = 'passphrase'
-        self.update(prompt=dict(id=number, text=text.strip(), kind=kind))
+        self.update(prompt=dict(id=number, text=text, kind=kind))
         try:
             slot[0].wait(300)
+            if not MUX and secret and slot[1] is not None and not replay:
+                self.typed[text] = slot[1]
             return slot[1]
         finally:
             self.answers.pop(number, None)
@@ -814,6 +992,9 @@ class Worker:
                 pass
             text = explain('\n'.join(client.errors) or text)
             self.update(ready=False)
+            self.typed.clear()
+            self.secrets.clear()
+            self.publish('failed')
         self.update(error=text[:1800])
         return text[:1800]
 
@@ -864,7 +1045,7 @@ class Worker:
             name = safe_name(item.get('name'))
             if not local_folder:
                 raise ValueError('Choose a local folder first')
-            local, remote = os.path.join(local_folder, name), posixpath.join(remote_folder, name)
+            local, remote = local_child(local_folder, name), posixpath.join(remote_folder, name)
             src, dst = (local, remote) if kind == 'upload' else (remote, local)
             jobs.append(self.new_job(kind, name, src, dst, item.get('dir'), batch, item.get('size')))
         if not jobs:
@@ -1048,7 +1229,8 @@ class Worker:
                     job['renamed'] = (posixpath if upload else os.path).basename(destination)
             overwrite = choice == 'overwrite'
         if upload:
-            client.upload(job['src'], destination, self.progress(), self.cancel.is_set, overwrite)
+            client.upload(job['src'], destination, self.progress(), self.cancel.is_set, overwrite,
+                          follow='/' not in job['name'])  # what the person chose; not what a folder holds
         else:
             client.download(job['src'], destination, self.progress(), self.cancel.is_set, overwrite)
         return 'done'
@@ -1064,7 +1246,7 @@ class Worker:
                 raise ValueError('A file with that name already exists on the server')
             with os.scandir(job['src']) as items:
                 for item in sorted(items, key=lambda i: (not i.is_dir(), i.name.casefold())):
-                    link_dir = item.is_symlink() and item.is_dir()
+                    link_dir = item.is_symlink()  # never followed, to a folder or to a file
                     folder = item.is_dir(follow_symlinks=False)
                     try:
                         size = None if folder or link_dir else item.stat().st_size
@@ -1073,21 +1255,36 @@ class Worker:
                     children.append((item.name, item.path, posixpath.join(job['dst'], item.name), folder, link_dir, size))
         else:
             if os.path.lexists(job['dst']):
+                if os.path.islink(job['dst']):
+                    raise ValueError('The local destination is a link: it is not followed')
                 if not os.path.isdir(job['dst']):
                     raise ValueError('A file with that name already exists on this computer')
             else:
                 os.mkdir(job['dst'])
             for entry in client.listing(job['src'])['entries']:
+                # Names come from the server: never let one point outside the folder.
+                try:
+                    dst, bad = local_child(job['dst'], entry['name']), None
+                except ValueError as error:
+                    dst, bad = None, str(error)
                 children.append((entry['name'], posixpath.join(job['src'], entry['name']),
-                                 os.path.join(job['dst'], entry['name']), entry['dir'] and not entry['link'],
-                                 entry['dir'] and entry['link'], entry.get('size')))
+                                 dst, entry['dir'] and not entry['link'],
+                                 entry['dir'] and entry['link'], entry.get('size'), bad))
         jobs = []
-        for name, src, dst, folder, link_dir, size in children:
-            child = self.new_job(job['kind'], job['name'] + '/' + name, src, dst, folder, job['batch'], size)
-            if link_dir:  # never followed: a link can point back up the tree
-                child.update(status='skipped', error='Link to a folder: not followed')
+        for name, src, dst, folder, link_dir, size, *bad in children:
+            bad = bad[0] if bad else None
+            child = self.new_job(job['kind'], job['name'] + '/' + name, src, dst or '', folder, job['batch'], size)
+            if bad:
+                child.update(status='skipped', error=f'{bad}: not downloaded')
+            elif link_dir:  # never followed: a link can point back up the tree, or at a secret
+                child.update(status='skipped', error='Link: not followed' if upload else 'Link to a folder: not followed')
             jobs.append(child)
         with self.lock:
+            # A hostile server can invent an endless tree: stop at sane limits.
+            if job['name'].count('/') >= MAX_DEPTH:
+                raise ValueError(f'Folders nested deeper than {MAX_DEPTH} levels are not transferred')
+            if len(self.jobs) + len(jobs) > MAX_JOBS:
+                raise ValueError(f'More than {MAX_JOBS} items in one queue: transfer less at a time')
             at = self.jobs.index(job) + 1 if job in self.jobs else len(self.jobs)
             self.jobs[at:at] = jobs
             self.touch_queue()
@@ -1132,6 +1329,10 @@ class Worker:
                     listing = client.listing('.')
                 self.set_listing(listing)
                 self.update(ready=True, message='Connected')
+                now = time.monotonic()
+                self.secrets = {text: (answer, now) for text, answer in self.typed.items()}
+                self.typed.clear()
+                self.publish('ready')
                 return
             client = self.client
             folder = self.snapshot()['path']
@@ -1171,6 +1372,9 @@ class Worker:
             self.update(message=message)
         except Exception as error:
             self.failed(error)
+            if args.get('action') == 'connect':
+                self.typed.clear()
+                self.publish('failed')
         finally:
             self.update(busy=False)
 
@@ -1189,7 +1393,7 @@ class Worker:
         folder = tempfile.mkdtemp(prefix='herdr-view-')
         try:
             target = os.path.join(folder, 'file')
-            client.download(remote, target, lambda done, total: None, self.cancel.is_set)
+            client.download(remote, target, lambda done, total: None, self.cancel.is_set, limit=VIEW_LIMIT)
             with open(target, 'rb') as handle:
                 data = handle.read(VIEW_LIMIT + 1)
         finally:
@@ -1202,6 +1406,9 @@ class Worker:
         self.stop.set()
         self.cancel.set()
         self.refuse_prompts()
+        self.typed.clear()
+        self.secrets.clear()
+        drop_session(self.alias)
         with self.lock:
             self.changed.notify_all()
         if self.client:
@@ -1222,6 +1429,7 @@ def handler_for(worker, token):
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
+        timeout = 30  # a connection that sends nothing is dropped
 
         def log_message(self, *_args):
             pass
@@ -1243,16 +1451,21 @@ def handler_for(worker, token):
                 raise ValueError('Request too large')
             return json.loads(self.rfile.read(size) or b'{}')
 
-        def handle_one_request(self):
-            worker.touch(1)
-            try:
-                super().handle_one_request()
-            finally:
-                worker.touch(-1)
+        def denied(self):
+            # Only an authenticated request counts as the view being there.
+            self.close_connection = True  # its body, if any, is never read
+            self.reply(403, dict(ok=False, error='Access denied'))
 
         def do_GET(self):
             if not self.allowed():
-                return self.reply(403, dict(ok=False, error='Access denied'))
+                return self.denied()
+            worker.touch(1)
+            try:
+                self.events()
+            finally:
+                worker.touch(-1)
+
+        def events(self):
             url = urlparse(self.path)
             if url.path != '/events':
                 return self.reply(404, dict(ok=False, error='No existe'))
@@ -1266,7 +1479,14 @@ def handler_for(worker, token):
 
         def do_POST(self):
             if not self.allowed():
-                return self.reply(403, dict(ok=False, error='Access denied'))
+                return self.denied()
+            worker.touch(1)
+            try:
+                self.post()
+            finally:
+                worker.touch(-1)
+
+        def post(self):
             try:
                 args = self.body()
                 if self.path == '/askpass':
@@ -1274,7 +1494,8 @@ def handler_for(worker, token):
                     # abandoned worker must still time out and refuse it.
                     worker.touch(-1)
                     try:
-                        answer = worker.ask(str(args.get('prompt', '')), str(args.get('kind') or 'secret'))
+                        answer = worker.ask(str(args.get('prompt', '')), str(args.get('kind') or 'secret'),
+                                            replay=bool(args.get('replay')))
                     finally:
                         worker.touch(1)
                     return self.reply(200, dict(ok=answer is not None, answer=answer))
@@ -1304,9 +1525,26 @@ def handler_for(worker, token):
     return Handler
 
 
+class Server(ThreadingHTTPServer):
+    """At most CONNECTIONS at once: anyone on this computer can reach 127.0.0.1."""
+    slots = threading.BoundedSemaphore(32)
+
+    def process_request(self, request, client_address):
+        if not self.slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.slots.release()
+
+
 def serve(alias, config, path='.'):
     worker, token = Worker(alias, config), secrets.token_hex(32)
-    server = ThreadingHTTPServer(('127.0.0.1', 0), handler_for(worker, token))
+    server = Server(('127.0.0.1', 0), handler_for(worker, token))
     server.daemon_threads = True
     url = f'http://127.0.0.1:{server.server_address[1]}'
     worker.url, worker.token = url, token
@@ -1316,10 +1554,17 @@ def serve(alias, config, path='.'):
     os.dup2(os.open(os.devnull, os.O_WRONLY), 1)
     threading.Thread(target=server.serve_forever, kwargs=dict(poll_interval=0.5), daemon=True).start()
     threading.Thread(target=worker.run_queue, daemon=True).start()
+    worker.publish('connecting')
     worker.launch(dict(action='connect', path=path))
+    beat = time.monotonic()
     try:
         while not worker.stop.is_set() and not worker.idle():
             worker.stop.wait(1)
+            if time.monotonic() - beat >= BEAT:
+                beat = time.monotonic()
+                worker.publish()
+                worker.secrets = {text: kept for text, kept in worker.secrets.items()
+                                  if beat - kept[1] < REPLAY_TTL}
     finally:
         worker.close()
         server.shutdown()
@@ -1327,7 +1572,7 @@ def serve(alias, config, path='.'):
 
 def start(alias, config, path='.'):
     ssh_command(alias, config)  # validate before spawning
-    child = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), 'serve', alias, config, path],
+    child = subprocess.Popen([sys.executable, '-I', str(Path(__file__).resolve()), 'serve', alias, config, path],
                              stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                              creationflags=NO_WINDOW, start_new_session=os.name != 'nt')
     line = child.stdout.readline()
@@ -1339,10 +1584,97 @@ def start(alias, config, path='.'):
     return dict(ok=True, **info)
 
 
+# --- the terminal: `shell` ------------------------------------------------
+
+NOBODY = 4       # seconds to wait for an SFTP pane to start signing in
+PATIENCE = 600   # the longest wait for a sign-in in progress
+
+
+def master_alive(alias, config):
+    if not MUX:
+        return False
+    try:
+        return subprocess.run(['ssh'] + config_args(config) + mux_options() + ['-O', 'check', alias],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def enter_pressed(seconds):
+    """Waits up to `seconds`; True if the person pressed Enter meanwhile."""
+    if os.name == 'nt':
+        import msvcrt
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            while msvcrt.kbhit():
+                if msvcrt.getwch() in '\r\n':
+                    return True
+            time.sleep(0.05)
+        return False
+    import select
+    try:
+        ready = select.select([sys.stdin], [], [], seconds)[0]
+    except (OSError, ValueError):
+        time.sleep(seconds)
+        return False
+    return bool(ready) and sys.stdin.readline() != ''
+
+
+def shell(alias, config):
+    """The SSH terminal of a host tab. Waits while the SFTP pane signs in (its
+    dialog asks once for both), then runs ssh on that connection. Enter skips
+    the wait; with no SFTP pane signing in, ssh starts at once and asks here."""
+    check_alias(alias)
+    say = lambda text: (sys.stdout.write(text), sys.stdout.flush())
+    started, waiting, info = time.monotonic(), False, None
+    say(f'\x1b[2mConnecting to {alias}…\x1b[0m\r\n')
+    while time.monotonic() - started < PATIENCE:
+        if master_alive(alias, config):
+            break
+        info = read_session(alias)
+        if info and info.get('state') == 'ready':
+            break
+        if info and info.get('state') == 'failed':
+            say('\x1b[2mThe SFTP pane could not sign in: signing in here.\x1b[0m\r\n')
+            break
+        if not info and time.monotonic() - started > NOBODY:
+            break
+        if info and not waiting:
+            waiting = True
+            say('\x1b[2mIf a sign-in dialog opens, answer it once: it serves SSH and SFTP.'
+                ' Press Enter to sign in here instead.\x1b[0m\r\n')
+        if enter_pressed(0.3):
+            break
+    argv = ['ssh'] + config_args(config) + mux_options() + [alias]
+    if MUX:
+        os.execvp('ssh', argv)
+    env = os.environ.copy()
+    url = str((info or {}).get('url', ''))
+    # Windows: the worker answers with what was typed in its dialog. Only a
+    # worker on this computer's loopback, never an address planted in the file.
+    if info and info.get('state') == 'ready' and LOOPBACK.fullmatch(url) and isinstance(info.get('token'), str):
+        env.update(SSH_ASKPASS=askpass_program(), SSH_ASKPASS_REQUIRE='force', HERDR_SFTP_REPLAY='1',
+                   HERDR_SFTP_URL=url, HERDR_SFTP_TOKEN=info['token'], HERDR_SFTP_PYTHON=sys.executable)
+        env.setdefault('DISPLAY', ':0')
+        argv = argv[:-1] + kbd_args() + argv[-1:]
+    sys.exit(subprocess.call(argv, env=env))
+
+
+LOOPBACK = re.compile(r'http://127\.0\.0\.1:\d{1,5}')
+
+
 if __name__ == '__main__':
     try:
         command = sys.argv[1]
-        if command == 'serve':
+        if command == 'shell':
+            try:
+                shell(*sys.argv[2:4])
+            except Exception as error:
+                # Never leave the person without a shell: plain ssh as a last resort.
+                sys.stderr.write(f'{error}\n')
+                os.execvp('ssh', ['ssh'] + config_args(sys.argv[3]) + [check_alias(sys.argv[2])])
+        elif command == 'serve':
             serve(*sys.argv[2:5])
         elif command == 'start':
             print(json.dumps(start(*sys.argv[2:5]), ensure_ascii=True))

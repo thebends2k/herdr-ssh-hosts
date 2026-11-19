@@ -1,25 +1,94 @@
 # SSH hosts
 
+## One tab per host
+
+Choosing a host opens a single tab named after the alias in **split view**: the
+**SSH terminal** on top, with the keyboard, and the two-pane **SFTP browser**
+below (**This computer** on the left, the server on the right, each at half the
+width). Choosing a host whose tab is open goes back to it; **Ctrl+Enter** (or
+Ctrl+click) opens another tab for it, which reuses the sign-in.
+
+Three views, one click each, from the **SSH | Split | SFTP** switch at the right
+of the SFTP toolbar or from the floating pill:
+
+- **SSH**: the terminal at full size; the SFTP pane keeps running (and transferring).
+- **Split**: both, SSH on top (the default).
+- **SFTP**: the browser at full size; the terminal keeps running.
+
+Closing one of the two panes leaves the other alone. The switch brings the
+missing one back, without signing in again while the connection lives.
+
+The **floating pill** (`props: { bar: true }`, optional, see the repository's
+README) only draws on host tabs. It shows the SFTP status (a green dot when
+connected, a spinner while connecting, amber when a sign-in dialog or a file
+conflict waits, red when it is not connected, `↑ 42%` while transferring) and
+the same three views. Drag it anywhere; it settles on the nearest edge.
+
+## Signing in once
+
+When OpenSSH needs a password, a key passphrase or confirmation of a new
+server's fingerprint, a **centered dialog** asks it once; the same answer
+serves SSH and SFTP. Meanwhile the terminal shows *Connecting to …* and starts
+by itself when the sign-in is done. **Enter** in the terminal skips the wait and
+signs in there instead; if the dialog's sign-in fails, the terminal asks too.
+
+The password is typed or pasted (for example from KeePassXC) into a masked
+field, handed only to OpenSSH, and never written to a file or an argument.
+OpenSSH's host key verification is never turned off; the dialog shows the
+fingerprint so you can compare it. Esc or Cancel refuses.
+
+- **Linux and macOS:** the first ssh of a host becomes an OpenSSH
+  **ControlMaster** (socket in `$XDG_RUNTIME_DIR/herdr-ssh/`, else
+  `/tmp/herdr-ssh-<uid>/`, private to you), which stays 2 minutes after its last
+  session (`ControlPersist`). The terminal, the browser and other tabs of that
+  host ride on it. Nothing is kept by the mod.
+- **Windows:** its OpenSSH has no ControlMaster. The browser's helper keeps the
+  password typed in the dialog **in memory**, only after it worked, and answers
+  the terminal's ssh with it through askpass **once**; it is forgotten then, after
+  2 minutes, or when the pane closes. So on Windows a second session of a host,
+  or a terminal reopened later, asks again (in the same dialog). Windows runs
+  askpass through `cmd.exe`, which cannot carry a server's text safely, so there
+  keyboard-interactive sign-in is off: password, key and passphrase work; a
+  server that only offers keyboard-interactive (some one-time-code setups) does not.
+
+A prompt written by the server (keyboard-interactive, which OpenSSH prefixes
+with `(user@host)`) is shown under the title "<alias> asks", never as a key
+passphrase or a fingerprint question. Links inside an uploaded folder are not
+followed (a link to `~/.ssh/id_ed25519` in a cloned project stays here), and a
+download refuses a local destination folder that is a link.
+
+Names that come from the server are checked before anything is written on this
+computer: a name with a slash or backslash, `..`, and on Windows a drive or
+stream (`C:x`, `x:y`), a device name (`NUL`, `COM1`…), a trailing dot or space,
+or `<>"|?*` is never downloaded (it shows as skipped, with the reason).
+
 ## SFTP browser
 
-Each host has a button with a folder-and-arrow icon on the right. It opens an
-**SFTP · alias** tab with two panes, like FileZilla: **This computer** on the
-left and the server on the right. Clicking the alias still opens SSH.
-
-- Each pane has its path as breadcrumbs (every folder is clickable; a click on
-  the free space lets you type the path, relative ones such as `..` included), ↑, ⟳,
-  a name filter and `.*` to show or hide hidden files. The Name, Size and
-  Modified columns sort when clicked (natural order: `file2` before `file10`).
-  Lists are virtual: large folders (up to 20,000 entries) scroll smoothly.
+- **One toolbar**: the connection status and alias (click to disconnect or
+  reconnect), a summary (the selection, the last message, or an error, whose
+  full text is in its tooltip), the actions (↑ upload, ↓ download, ⟳ refresh,
+  + new folder, ✎ rename, ✕ delete, each with its key in the tooltip), and the
+  SSH | Split | SFTP switch.
+- **One header row per pane**: its path as breadcrumbs (every folder is
+  clickable; a click on the free space lets you type the path, relative ones
+  such as `..` included), a name filter and `.*` to show or hide hidden files.
+  No footers: counts are in the pane icon's tooltip.
+- Sort from the right-click menu: name, size or modified, again to reverse
+  (natural order: `file2` before `file10`). Lists are virtual: large folders
+  (up to 20,000 entries) scroll smoothly.
+- If the layout draws its pane header over the pane (`reveal: "hover"`), the
+  toolbar starts below it, so the header never hides its buttons. A header mod
+  that draws nothing over SFTP panes can give that room back by adding its name
+  to `shared("ssh-hosts.clearHeaders")`.
 - On Windows the local pane starts at **Computer**, with the drives (`C:`, `D:`…).
 - A click selects and marks the active pane; **Ctrl+click** adds or removes and
   **Shift+click** selects a range. Double-click opens a folder or sends the file
-  to the other pane. **Upload →** and **← Download** send the selection of each
-  side (files and folders). **New folder**, **Rename** and **Delete** act on the
-  active pane; Delete accepts several items at once.
+  to the other pane. ↑ and ↓ send the selection of each side (files and
+  folders). New folder, Rename and Delete act on the active pane; Delete
+  accepts several items at once.
 - **Right-click** opens a menu with what can be done with the selection or the
   folder: view a file on the server, transfer, rename, delete, new folder, copy
-  paths, refresh, and show or hide hidden files.
+  paths, refresh, show or hide hidden files, and sort.
 - Keyboard, with the list focused:
 
   | Key | Action |
@@ -38,11 +107,12 @@ left and the server on the right. Clicking the alias still opens SSH.
   In dialogs, Enter confirms and Escape cancels.
 - Files and **whole folders** are transferred. You can also drag files and
   folders from the system onto the server pane.
-- Everything goes through a **queue**: at the bottom you see the total (files,
-  bytes, speed and time left) and, expanded, one row per file with its status.
-  Each row can be cancelled or retried; there are also **Cancel all**, **Retry**
-  for what failed, and **Clear** for what finished. You can keep browsing
-  meanwhile.
+- Everything goes through a **queue**, a strip at the bottom that only appears
+  while there are transfers: the running file, how many wait, the progress,
+  speed and time left. A click unfolds one row per file, each of which can be
+  cancelled or retried; there are also **Cancel all**, **Retry** for what
+  failed, and **Clear**. When everything finished well the strip goes away
+  after 3 seconds; problems stay until cleared. You can keep browsing meanwhile.
 - Folders are walked as they go, so queuing a huge folder is instant. Links to
   folders are not followed (they could form loops); links to files are
   transferred as files.
@@ -63,48 +133,45 @@ read-only viewer, with syntax highlighting. The helper reads it into a
 temporary folder, which is deleted right away; nothing is saved and nothing can
 be edited. Files over 1 MB, binary files and folders are refused with a message.
 
-### Passwords and fingerprints
-
-When OpenSSH needs a password, a key passphrase or confirmation of a new
-server's fingerprint, the tab shows a dialog of its own (the same on Linux,
-macOS and Windows). The password is typed or pasted (for example from
-KeePassXC) into a masked field, handed only to OpenSSH, and never stored in any
-file or argument. OpenSSH's host key verification is never turned off; the
-dialog shows the fingerprint so you can compare it. Aliases, users, keys and
-jump hosts are read from `~/.ssh/config`.
-
 ### How it works
 
 It uses only OpenSSH (`ssh`) and Python 3 with its standard library; it installs
-no packages or services. Each open tab starts a helper (`sftp_bridge.py`) with
-an `ssh -s sftp` connection. The tab talks to it over HTTP on `127.0.0.1` with a
-random key that is never written to disk (the same helper lists local folders,
-identically on Linux and Windows): actions go through `/rpc` and changes arrive
-instantly through `/events` (no polling). OpenSSH asks for passwords through
-`askpass.sh` (`askpass.cmd` on Windows), which asks the tab. Transfers send up
-to 64 blocks of 32 KB at a time, like OpenSSH's `sftp` client, and share the
-connection with browsing: every request carries a number and a reader thread
-hands each response to whoever asked for it.
+no packages or services.
 
-The helper exits on **Disconnect**, when the tab is closed, or after 90 seconds
-without the tab. Transfers use `.herdr-upload-*` and `.herdr-download-*`
+- The **terminal** runs `sftp_bridge.py shell <alias> <config>`: it waits while
+  the SFTP pane signs in (it reads `<runtime>/<alias>.json`, which the helper
+  rewrites every 2 seconds), then runs `ssh` with the same ControlMaster
+  options. With no SFTP pane signing in, it starts ssh after 4 seconds.
+- Each **SFTP pane** starts a helper (`sftp_bridge.py`) with an `ssh -s sftp`
+  connection. The pane talks to it over HTTP on `127.0.0.1` with a random key
+  (the same helper lists local folders, identically on Linux and Windows):
+  actions go through `/rpc` and changes arrive instantly through `/events` (no
+  polling). OpenSSH asks for passwords through `askpass.sh` (`askpass.cmd` on
+  Windows), which asks the helper, which asks the pane, which opens the dialog.
+- Transfers send up to 64 blocks of 32 KB at a time, like OpenSSH's `sftp`
+  client, and share the connection with browsing: every request carries a
+  number and a reader thread hands each response to whoever asked for it.
+
+The helper exits on disconnect, when the pane is closed, or after 90 seconds
+without it. Transfers use `.herdr-upload-*` and `.herdr-download-*`
 temporaries: a cancellation cleans them up; a forced close or a lost connection
 can leave an incomplete one behind.
 
 ## SSH picker
 
-An **SSH** row in the sidebar of a layout of your own (for example under Spaces) with the
-number of hosts. Clicking it opens a popup list, sized to its content:
+Opens with **Ctrl+Shift+H** (`mod.open:ssh-hosts`, see the repository's
+README), from an optional **SSH** row in a sidebar, or from a button in a tab
+bar of your own. If the layout holds it as a **side panel** (a block with
+`"props": { "panel": true }`, next to Files and Changes), all of them open the
+panel instead of the popup; it stays open while you open hosts, and Esc or ×
+closes it:
 
-- **Search** on top, with the cursor already in it: it filters by alias, host or
-  user. ↑ ↓ choose; **Enter** opens a terminal, **Shift+Enter** the file
-  browser, **Ctrl+Enter** a new terminal even if one is already open. Esc
-  closes.
+- **Search** on top, with the cursor already in it: it filters by alias, host,
+  user or group. ↑ ↓ choose; **Enter** opens the host's tab (or goes to it),
+  **Ctrl+Enter** opens another one. Esc closes.
 - Each host shows its alias and, below, `user@host:port` (port 22 is not shown),
-  plus a **jump** tag if it uses `ProxyJump`. On hover, **Terminal** and **Files**
-  icon buttons and a ☆ to pin it to the top appear.
-- A dot next to the alias means a terminal or a file browser is already open for
-  that host; choosing it goes to that tab instead of opening another.
+  plus a **jump** tag if it uses `ProxyJump`. On hover, a ☆ pins it to the top.
+- A dot next to the alias means a tab is already open for that host.
 - Sections: **Pinned**, **Recent** (when there are more than 6 hosts) and then
   the groups of the file. Pinned hosts, recents and collapsed groups are
   remembered.
@@ -119,7 +186,7 @@ number of hosts. Clicking it opens a popup list, sized to its content:
 
   # Development
   Host dev-api
-      HostName 10.0.0.5
+      HostName 192.0.2.10
 
   # Production
   Host prod-api
@@ -130,8 +197,7 @@ number of hosts. Clicking it opens a popup list, sized to its content:
 - Only explicit aliases of `~/.ssh/config` are read (not patterns or `Include`
   files). OpenSSH resolves user, port and other options when connecting; what
   the list shows is informational.
-- Choosing an alias opens a tab with `ssh -F <local-config> <alias>` in a local
-  space; if there is none, an **SSH** space is created. The password, if needed,
-  is typed in the terminal; the picker never stores it.
+- A host's tab opens in the active local space; if there is none, an **SSH**
+  space is created.
 
-Requirements: OpenSSH on the PATH and a local ~/.ssh/config. No configurations or credentials are included. The mod does not enumerate Include files. Installation and how to add it to a layout: see the README at the repository root.
+Requirements: OpenSSH on the PATH and a local ~/.ssh/config. No configurations or credentials are included. Installation and how to add it to a layout: see the README at the repository root.

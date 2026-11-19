@@ -1,16 +1,17 @@
 import { div, svg } from 'gpui-kit';
 import { h_flex, v_flex, Editor, EditorState, Input, InputState, Scrollbar, v_virtual_list, VirtualListScrollHandle } from 'gpui-base';
-import { appHome, exec, home, props, settings, shared, setShared, theme, window } from 'herdr';
+import { checking, closeOverlay, exec, home, layout, openOverlay, props, settings, shared, setShared, theme } from 'herdr';
+import { CONFIG, HELPER, PYTHON, WINDOWS, setMode, tabState } from './session.js';
 
 // The SFTP view: this computer on the left, the server on the right.
 // sftp_bridge.py owns the SSH connection and lists local folders too; this view
 // talks to it over loopback HTTP: /rpc runs an action, /events waits until the
 // state changes (progress and listings arrive at once, without polling), and
-// password or host-key questions from OpenSSH arrive as `state.prompt`.
+// password or host-key questions from OpenSSH arrive as `state.prompt` and are
+// asked in a centered dialog (main.js, `auth`), once for SSH and SFTP.
 
 const ROW = 28;
 const SIDES = ['local', 'remote'];
-const WINDOWS = () => window()?.platform === 'windows';
 const basename = path => path.replace(/[\\/]+$/, '').split(/[\\/]/).pop();
 const sizeText = size => size == null ? '' : size < 1024 ? `${size} B` : size < 1048576 ? `${(size / 1024).toFixed(1)} KB`
   : size < 1073741824 ? `${(size / 1048576).toFixed(1)} MB` : `${(size / 1073741824).toFixed(2)} GB`;
@@ -24,7 +25,26 @@ const dateText = mtime => {
 };
 const permText = mode => mode == null ? '' : [6, 3, 0].map(s => ((mode >> s) & 4 ? 'r' : '-') + ((mode >> s) & 2 ? 'w' : '-') + ((mode >> s) & 1 ? 'x' : '-')).join('');
 const duration = seconds => seconds < 60 ? `${Math.ceil(seconds)} s` : `${Math.floor(seconds / 60)} min ${Math.ceil(seconds % 60)} s`;
-const icon = name => svg(`mods/ssh-hosts/${name}.svg`).size(16).flex_none();
+const icon = (name, size = 16) => svg(`mods/ssh-hosts/${name}.svg`).size(size).flex_none();
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const SORTS = [['name', 'Name'], ['size', 'Size'], ['mtime', 'Modified']];
+
+// How much of the pane's top a pane header drawn over it (reveal: hover) covers:
+// the toolbar starts below it, so the header never hides its buttons. A header
+// mod that draws nothing over SFTP panes can say so, and gets the room back:
+//   setShared('ssh-hosts.clearHeaders', [...(shared('ssh-hosts.clearHeaders') ?? []), '<its name>'])
+function headerInset() {
+  const find = node => {
+    if (!node || typeof node !== 'object' || node.hidden) return null;
+    if (node.content?.tab === 'active') return node.content.pane?.header ?? null;
+    for (const child of node.children ?? []) { const found = find(child); if (found) return found; }
+    return null;
+  };
+  const header = find(layout());
+  if (!header || header.reveal !== 'hover' || (header.position ?? 'top') !== 'top') return 0;
+  if ((shared('ssh-hosts.clearHeaders') ?? []).includes(header.content?.mod)) return 0;
+  return Number(header.height) || 30;
+}
 const EMPTY = { path: '.', ready: false, busy: false, transfer: null, revision: 0, listing: -1, local_path: null, local_listing: -1, queue: -1, totals: null };
 const STATUS = { queued: 'Queued', running: 'Transferring', conflict: 'Already exists: waiting', done: 'Done', skipped: 'Skipped', failed: 'Failed', cancelled: 'Cancelled' };
 
@@ -149,23 +169,40 @@ export class SftpPanel {
   init(cx) {
     this.alias = props()?.alias || '';
     this.target = props()?.target || '';
-    this.config = home().replace(/[\\/]+$/, '') + '/.ssh/config';
-    this.helper = appHome().replace(/[\\/]+$/, '') + '/mods/ssh-hosts/sftp_bridge.py';
-    this.python = WINDOWS() ? 'python' : 'python3';
+    this.tab = props()?.tab || null;
+    this.config = CONFIG();
+    this.helper = HELPER();
+    this.python = PYTHON();
     this.state = { ...EMPTY };
     this.generation = 0;
     this.panels = { local: new Panel('local', this, cx), remote: new Panel('remote', this, cx) };
     this.active = 'remote';
     this.name = InputState.new({ placeholder: 'Name' });
-    this.secret = InputState.new({ placeholder: '' });
-    this.secret.set_masked(true);
     this.name.on('submit', (_e, cx) => this.submit(cx));
-    this.secret.on('submit', (_e, cx) => this.answer(this.secret.value(), cx));
     this.width = 1000;
     this.jobs = [];
     this.viewer = null;
-    this.queueOpen = load('queueOpen', true);
-    this.connect(cx);
+    this.queueOpen = load('queueOpen', false);
+    this.lastStatusKey = null;
+    if (!checking()) this.connect(cx);
+  }
+
+  publishStatus() {
+    if (!this.tab || this.closed) return;
+    const s = this.state, n = s.totals;
+    const connecting = this.starting || (this.conn && !s.ready && s.busy);
+    const transferring = Boolean(n && (n.waiting || n.folders));
+    const pct = transferring && n.bytes ? Math.min(100, Math.round((n.moved / n.bytes) * 100)) : null;
+    const job = transferring && s.transfer ? this.jobs.find(j => j.id === s.transfer.id) : null;
+    const dir = job?.kind === 'download' ? 'down' : 'up';
+    const status = s.prompt ? 'prompt' : s.conflict ? 'conflict' : transferring ? 'transferring'
+      : s.ready ? 'connected' : connecting ? 'connecting' : (this.error || s.error) ? 'error' : 'closed';
+    const key = `${status}:${pct ?? ''}:${dir}`;
+    if (key === this.lastStatusKey) return;
+    this.lastStatusKey = key;
+    const all = { ...(shared('ssh-hosts.sftp.live') ?? {}) };
+    all[this.tab] = { alias: this.alias, status, pct, dir };
+    setShared('ssh-hosts.sftp.live', all);
   }
 
   // --- talking to the bridge ---------------------------------------------
@@ -177,13 +214,14 @@ export class SftpPanel {
   connect(cx) {
     if (this.starting) return;
     this.starting = true;
+    this.answeredSecret = null;
     this.error = null;
     this.state = { ...EMPTY };
     this.panels.remote.entries = [];
     const start = load('path:' + this.alias, '.');
     cx.spawn(async cx => {
       try {
-        const result = await exec(this.python, [this.helper, 'start', this.alias, this.config, start]);
+        const result = await exec(this.python, ['-I', this.helper, 'start', this.alias, this.config, start]);
         let data;
         try { data = JSON.parse(result.stdout.trim()); }
         catch { throw new Error(result.stderr.trim() || 'Could not start the SFTP browser. Is Python 3 installed?'); }
@@ -195,8 +233,9 @@ export class SftpPanel {
         const local = load('local:' + this.alias, home());
         this.rpc({ action: 'local_list', path: local }, cx, cx => this.rpc({ action: 'local_list', path: home() }, cx));
       } catch (error) { this.error = String(error.message || error); }
-      finally { this.starting = false; if (!this.closed) cx.notify(); }
+      finally { this.starting = false; this.publishStatus(); if (!this.closed) cx.notify(); }
     });
+    this.publishStatus();
     cx.notify();
   }
 
@@ -226,7 +265,9 @@ export class SftpPanel {
           if (++failures >= 3) {
             this.conn = null;
             this.state = { ...this.state, ready: false, busy: false, transfer: null, prompt: null };
+            this.askInDialog(null);
             this.error = 'Lost the connection to the SFTP browser. Press Connect to retry.';
+            this.publishStatus();
           }
         }
         cx.notify();
@@ -267,20 +308,15 @@ export class SftpPanel {
     } else state.local_listing = old.local_listing;
     if (state.entries) remote.prune();
     if (state.local_entries) local.prune();
-    if (state.prompt && state.prompt.id !== old.prompt?.id) {
-      this.secret.set_value('');
-      if (['secret', 'passphrase'].includes(state.prompt.kind)) {
-        this.retry = this.answeredSecret === true;
-        this.secret.focus();
-      }
-    }
-    if (state.ready && !old.ready) this.answeredSecret = false;
+    if (state.prompt?.id !== old.prompt?.id) this.askInDialog(state.prompt);
+    if (state.ready && !old.ready) this.answeredSecret = null;
     if (state.conflict && state.conflict.id !== old.conflict?.id) this.applyAll = false;
     if (state.message && state.message !== old.message && !state.busy && this.form) {
       this.form = null;
       this.panels[this.active].focus.focus();  // back to the list the form was for
     }
     this.state = state;
+    this.publishStatus();
   }
 
   // --- actions -------------------------------------------------------------
@@ -295,16 +331,22 @@ export class SftpPanel {
     this.rpc({ action: side === 'local' ? 'local_list' : 'list', path }, cx);
   }
 
-  answer(value, cx) {
-    const prompt = this.state.prompt;
-    if (!prompt) return;
-    if (['secret', 'passphrase'].includes(prompt.kind) && value != null) this.answeredSecret = true;
-    this.rpc({ action: 'answer', id: prompt.id, value }, cx);
-    this.secret.set_value('');
+  // OpenSSH's question, in a centered dialog over the window: the SFTP pane may
+  // be small or in the background (SSH mode) while the terminal waits on it.
+  askInDialog(prompt) {
+    if (this.dialog) { closeOverlay(this.dialog); this.dialog = null; }
+    if (!prompt || !this.conn || this.closed) return;
+    const secret = ['secret', 'passphrase', 'server'].includes(prompt.kind);
+    // The same question again means the last answer was refused.
+    const retry = secret && this.answeredSecret === prompt.text;
+    if (secret) this.answeredSecret = prompt.text;
+    this.dialog = openOverlay({ mod: 'ssh-hosts', kind: 'dialog', modal: true, width: 440,
+      props: { auth: { url: this.conn.url, token: this.conn.token, prompt, retry, alias: this.alias, target: this.target } } });
   }
 
   disconnect(cx) {
     const conn = this.conn;
+    this.askInDialog(null);
     this.generation++;
     this.conn = null;
     this.state = { ...EMPTY };
@@ -313,6 +355,7 @@ export class SftpPanel {
     this.viewer = null;
     this.form = null;
     this.error = null;
+    this.publishStatus();
     if (conn) cx.spawn(async () => { await this.post({ action: 'close' }, conn).catch(() => {}); });
     cx.notify();
   }
@@ -441,7 +484,7 @@ export class SftpPanel {
     const panel = this.panels[side], m = e.modifiers, cmd = m.control || m.platform;
     const k = e.key, other = side === 'local' ? 'remote' : 'local';
     const handled = () => cx.stop_propagation();
-    if (this.state.prompt || this.state.conflict) return;
+    if (this.state.conflict) return;
     if (this.viewer) {
       if (k === 'escape' || k === 'enter' || k === 'f3') { this.closeViewer(cx); handled(); }
       return;
@@ -495,6 +538,13 @@ export class SftpPanel {
     items.push(['Refresh', 'Ctrl+R', cx => this.list(side, '.', cx), usable]);
     items.push([panel.showHidden ? 'Hide hidden files' : 'Show hidden files', 'Ctrl+H',
       cx => { panel.showHidden = !panel.showHidden; panel.save(); cx.notify(); }, true]);
+    items.push(['-']);
+    // Sorting lives here: the panel has no column header row.
+    for (const [key, label] of SORTS) {
+      const on = panel.sort.key === key;
+      items.push([`${on ? '✓ ' : ''}Sort by ${label.toLowerCase()}`, on ? (panel.sort.dir > 0 ? '▲' : '▼') : '',
+        cx => this.sortBy(side, key, cx), true]);
+    }
     return items;
   }
 
@@ -527,9 +577,9 @@ export class SftpPanel {
 
   // --- drawing ---------------------------------------------------------------
 
-  button(t, id, title, fn, { active = true, danger = false, primary = false, glyph = null, tip = null, on = false } = {}) {
-    return h_flex().id('sftp-' + id).h(28).px(glyph && !title ? 0 : 10).when(glyph && !title, el => el.w(28).justify_center())
-      .gap(6).items_center().rounded(6).flex_none()
+  button(t, id, title, fn, { active = true, danger = false, primary = false, glyph = null, tip = null, on = false, h = 24 } = {}) {
+    return h_flex().id('sftp-' + id).h(h).px(glyph && !title ? 0 : 8).when(glyph && !title, el => el.w(h).justify_center())
+      .gap(5).items_center().rounded(5).flex_none()
       .when(!primary, el => el.border_1().border_color(on ? t.accent : t.border))
       .bg(primary && active ? danger ? t.ansi1 : t.solid : on ? t.selected : '#00000000')
       .role('button').accessibility_label(tip || title).when(Boolean(tip), el => el.tooltip(tip)).disabled(!active)
@@ -538,38 +588,14 @@ export class SftpPanel {
       .when(Boolean(glyph), el => el.child(glyph)).when(Boolean(title), el => el.child(title));
   }
 
-  input(t, state, label, enabled = true) {
-    return Input.new(state).h(28).px(8).min_w(0).flex_1().rounded(6).border_1().border_color(t.input)
+  input(t, state, label, enabled = true, h = 24) {
+    return Input.new(state).h(h).px(7).min_w(0).flex_1().rounded(5).border_1().border_color(t.input)
       .bg(t.background).text_color(t.foreground).text_size(12).accessibility_label(label).disabled(!enabled);
   }
 
   card(t, title, ...children) {
     return v_flex().w(440).max_w('100%').p(16).gap(10).rounded(10).bg(t.popover).border_1().border_color(t.border)
       .child(div().font_semibold().text_size(13).child(title)).children(children);
-  }
-
-  // A question from OpenSSH: password, passphrase, host key or approval.
-  promptCard(t, prompt) {
-    const mono = settings().font_family ?? 'JetBrains Mono';
-    const text = div().text_color(t.muted).whitespace_normal().font_family(mono).text_size(11).child(prompt.text);
-    const actions = (...items) => h_flex().gap(8).justify_end().children(items);
-    if (prompt.kind === 'hostkey') {
-      return this.card(t, 'Verify the server', text,
-        div().text_color(t.foreground).whitespace_normal().child('This is the first connection to this server, or its fingerprint changed. Compare it with the server’s before trusting it.'),
-        actions(this.button(t, 'hk-no', 'Reject', cx => this.answer('no', cx)),
-          this.button(t, 'hk-yes', 'Trust and connect', cx => this.answer('yes', cx), { primary: true })));
-    }
-    if (prompt.kind === 'approve' || prompt.kind === 'info') {
-      return this.card(t, 'OpenSSH', text,
-        actions(this.button(t, 'ap-no', 'Cancel', cx => this.answer(null, cx)),
-          ...(prompt.kind === 'approve' ? [this.button(t, 'ap-yes', 'Accept', cx => this.answer('', cx), { primary: true })] : [])));
-    }
-    return this.card(t, prompt.kind === 'passphrase' ? 'Key passphrase' : 'Password', text,
-      ...(this.retry ? [div().text_color(t.ansi1).child('Not accepted. Try again.')] : []),
-      this.input(t, this.secret, prompt.text).flex_none().w_full(),
-      div().text_size(11).text_color(t.dim).child('Sent only to OpenSSH; never stored.'),
-      actions(this.button(t, 'pw-cancel', 'Cancel', cx => this.answer(null, cx)),
-        this.button(t, 'pw-ok', 'Connect', cx => this.answer(this.secret.value(), cx), { primary: true })));
   }
 
   formCard(t) {
@@ -647,7 +673,7 @@ export class SftpPanel {
     if (panel.editing) return div().flex_1().min_w(0).child(this.input(t, panel.pathInput, 'Path').w_full());
     const all = this.crumbs(side, path);
     const parts = all.length > 5 ? [all[0], { label: '…' }, ...all.slice(-3)] : all;
-    return h_flex().id(`path-${side}`).flex_1().min_w(0).h(28).px(6).gap(2).items_center().rounded(6)
+    return h_flex().id(`path-${side}`).flex_1().min_w(0).h(24).px(6).gap(2).items_center().rounded(5)
       .border_1().border_color(t.border).overflow_hidden().tooltip(path ? 'Click to type a path' : '')
       .on_click((_e, cx) => {
         if (!this.usable(side)) return;
@@ -685,8 +711,9 @@ export class SftpPanel {
         this.button(t, `retry-start-${side}`, 'Retry', cx => this.connect(cx), { primary: true }));
     }
     if (remote && !s.ready) {
-      if (connecting) return block(`Connecting to ${this.alias}…`,
-        s.prompt ? '' : 'If the server asks for a password or to confirm its fingerprint, a dialog will appear.', null, true);
+      if (connecting) return block(s.prompt ? 'Waiting for the sign-in dialog…' : `Connecting to ${this.alias}…`,
+        s.prompt ? 'One sign-in serves both the SSH terminal and this browser.'
+          : 'If the server asks for a password or to confirm its fingerprint, a dialog will appear.', null, true);
       const shown = this.error || (s.error && s.error !== this.dismissedError);  // the banner above says why
       return block(`Not connected to ${this.alias}`, shown ? '' : firstLine(s.error),
         this.button(t, 'reconnect-panel', 'Reconnect', cx => this.reconnect(cx), { primary: true }));
@@ -724,38 +751,32 @@ export class SftpPanel {
     const cols = { date: width > 360, perms: remote && width > 560 };
     const connecting = this.starting || (this.conn && !s.ready && s.busy);
     const empty = this.emptyState(t, side, entries, connecting);
-    const head = (key, label, w) => h_flex().id(`sort-${side}-${key}`).when(Boolean(w), el => el.w(w).justify_end())
-      .when(!w, el => el.flex_1()).gap(4).items_center().rounded(4).hover(s => s.text_color(t.foreground))
-      .on_click((_e, cx) => this.sortBy(side, key, cx))
-      .child(label).when(panel.sort.key === key, el => el.child(panel.sort.dir > 0 ? '▲' : '▼'));
-    const shownCount = entries.length, total = panel.entries.length;
     const focused = panel.focus.is_focused();
-    const marked = panel.marked.size;
+    const active = this.active === side;
+    const label = remote ? this.alias : 'Local';
+    const sideTip = remote ? `${this.alias}${this.target ? ' · ' + this.target : ''}` : 'This computer';
+    const count = !this.conn || (remote && !s.ready) ? '' : entries.length === panel.entries.length
+      ? `${panel.entries.length}` : `${entries.length} of ${panel.entries.length}`;
 
     return v_flex().id(`panel-${side}`).flex_1().min_w(0).min_h(0).rounded(8).border_1()
-      .border_color(this.active === side ? t.accent : t.border).bg(t.background)
+      .border_color(active ? t.accent : t.border).bg(t.background)
       .on_mouse_down('left', (_e, cx) => { if (this.active !== side) { this.active = side; panel.focus.focus(); cx.notify(); } })
       .when(remote, el => el.on_drop((event, cx) => {
         if (!this.canTransfer || !event.paths?.length) return;
         this.rpc({ action: 'enqueue', kind: 'upload', paths: event.paths }, cx);
       }))
-      .child(h_flex().px(10).pt(8).gap(6).items_center()
-        .child(div().text_color(t.muted).child(icon(remote ? 'sftp' : 'folder')))
-        .child(div().font_semibold().truncate().child(remote ? this.alias : 'This computer'))
-        .when(remote && Boolean(this.target), el => el.child(div().min_w(0).truncate().text_color(t.dim).text_size(11).child(this.target)))
-        .child(div().flex_1())
-        .child(this.button(t, `hidden-${side}`, '.*', cx => { panel.showHidden = !panel.showHidden; panel.save(); cx.notify(); },
-          { on: panel.showHidden, tip: panel.showHidden ? 'Hide hidden files' : 'Show hidden files' }))
-        .child(div().w(width > 460 ? 150 : 110).flex_none().child(this.input(t, panel.search, 'Filter by name', usable))))
-      .child(h_flex().px(10).py(6).gap(6).items_center()
-        .child(this.button(t, `up-${side}`, '', cx => this.list(side, '..', cx), { active: usable, glyph: div().child('↑'), tip: 'Parent folder' }))
-        .child(this.button(t, `refresh-${side}`, '', cx => this.list(side, '.', cx), { active: usable, glyph: icon('refresh'), tip: 'Refresh' }))
-        .child(this.pathBar(t, side, path)))
-      .child(h_flex().px(18).h(22).flex_none().gap(8).items_center().text_size(11).text_color(t.dim)
-        .child(div().w(16)).child(head('name', 'Name')).child(head('size', 'Size', 72))
-        .when(cols.date, el => el.child(head('mtime', 'Modified', 112)))
-        .when(cols.perms, el => el.child(div().w(80).text_right().child('Permissions'))))
-      .child(div().flex_1().min_h(0).relative().mx(10)
+      // The panel's one header row: which side, where, filter, hidden files.
+      .child(h_flex().h(34).flex_none().px(6).gap(5).items_center().border_b_1().border_color(t.border)
+        .child(h_flex().gap(5).px(2).items_center().flex_none().tooltip(`${sideTip}${count ? ' · ' + count + ' items' : ''}`)
+          .child(div().text_color(active ? t.accent : t.muted).child(icon(remote ? 'server' : 'folder', 14)))
+          .when(width > 420, el => el.child(div().max_w(110).truncate().font_semibold().text_size(11.5)
+            .text_color(active ? t.foreground : t.muted).child(label))))
+        .child(this.pathBar(t, side, path))
+        .child(div().w(width > 480 ? 120 : 84).flex_none().child(this.input(t, panel.search, 'Filter by name', usable)))
+        .child(this.button(t, `hidden-${side}`, '', cx => { panel.showHidden = !panel.showHidden; panel.save(); cx.notify(); },
+          { on: panel.showHidden, glyph: div().text_size(11).child('.*'),
+            tip: panel.showHidden ? 'Hide hidden files (Ctrl+H)' : 'Show hidden files (Ctrl+H)' })))
+      .child(div().flex_1().min_h(0).relative().mx(4).my(4)
         .id(`keys-${side}`).track_focus(panel.focus)
         .on_key_down((e, cx) => this.key(side, e, cx))
         // The press comes before the row's click: keep its modifiers and click count for it.
@@ -775,95 +796,161 @@ export class SftpPanel {
           })
           .size_full())
         .child(Scrollbar.vertical(`list-${side}`).viewport_from_layout().absolute().inset_0())
-        .when(Boolean(empty), el => el.child(empty)))
-      .child(h_flex().px(12).h(26).flex_none().items_center().text_size(11).text_color(t.dim)
-        .child(div().flex_1().truncate().child(!this.conn || (remote && !s.ready) ? ''
-          : `${shownCount === total ? total : `${shownCount} of ${total}`} items`
-            + ((remote ? s.limited : s.local_limited) ? ' (list truncated)' : '')
-            + (marked > 1 ? ` · ${marked} selected (${sizeText(panel.selection.reduce((n, e) => n + (e.dir ? 0 : e.size ?? 0), 0)) || '0 B'})`
-              : panel.entry ? ` · “${panel.entry.name}”${panel.entry.dir ? '' : ' ' + sizeText(panel.entry.size)}` : ''))));
+        .when(Boolean(empty), el => el.child(empty)));
   }
 
-  // The transfer queue: totals, the current file and, unfolded, one row per file.
-  queue(t) {
+  // The transfer queue: a strip that only exists while there are transfers.
+  // Folded it shows the running one; unfolded, every job. It goes away 3 s
+  // after everything finished well; problems stay until cleared.
+  queue(t, cx) {
     const s = this.state, x = s.transfer, n = s.totals;
     const jobs = this.jobs ?? [];
-    if (!n || !n.files && !n.folders && !jobs.length) {
-      const text = s.busy ? (s.ready ? 'Working…' : 'Connecting…') : s.message
-        || 'Double-click: open a folder or send the file to the other side · Drag files or folders onto the server panel to upload them';
-      return h_flex().px(12).h(32).flex_none().items_center().border_t_1().border_color(t.border).text_color(t.muted)
-        .child(div().flex_1().truncate().child(text));
-    }
+    if (!n || (!n.files && !n.folders && !jobs.length)) return null;
     const pct = n.bytes ? Math.min(100, (n.moved / n.bytes) * 100) : 0;
     const problems = n.failed + n.cancelled, finished = n.done + n.skipped + problems;
-    const summary = n.waiting || n.folders
-      ? `${n.done + n.skipped} of ${n.files} files${n.folders ? ' (scanning folders…)' : ''} · ${sizeText(n.moved)} of ${sizeText(n.bytes)}`
-      : `Finished: ${n.done} transferred${n.skipped ? `, ${n.skipped} skipped` : ''}`
-        + (problems ? `, ${problems} with problems` : '');
+    const working = Boolean(n.waiting || n.folders);
+    const running = x ? jobs.find(j => j.id === x.id) : null;
+    const waiting = Math.max(0, n.files - finished - (running ? 1 : 0));
+    if (!working && !problems && finished) {
+      const key = `${s.queue}:${finished}`;
+      if (this.autoClear !== key) {
+        this.autoClear = key;
+        cx.spawn(async cx => {
+          await cx.sleep(3000);
+          if (this.autoClear === key && !this.closed && this.conn) this.rpc({ action: 'clear' }, cx);
+        });
+      }
+    }
+    const headline = running
+      ? `${running.kind === 'upload' ? '↑' : '↓'} ${running.name}${x.total ? ` · ${Math.floor((x.done / x.total) * 100)}%` : ''}`
+      : working ? `Preparing ${n.folders ? 'folders' : 'files'}…`
+        : `Done: ${n.done} transferred${n.skipped ? `, ${n.skipped} skipped` : ''}${problems ? `, ${problems} with problems` : ''}`;
     const rows = jobs.slice(0, 120);
     const color = { done: t.done, failed: t.ansi1, cancelled: t.dim, skipped: t.dim, conflict: t.blocked, running: t.accent, queued: t.muted };
     const row = job => {
-      const running = x && x.id === job.id;
-      const label = running && x.total ? `${Math.floor((x.done / x.total) * 100)} %` : job.renamed ? `Done as “${job.renamed}”` : STATUS[job.status];
-      return h_flex().id('job-' + job.id).h(26).px(8).gap(8).items_center().rounded(5).flex_none()
+      const now = x && x.id === job.id;
+      const label = now && x.total ? `${Math.floor((x.done / x.total) * 100)} %` : job.renamed ? `Done as “${job.renamed}”` : STATUS[job.status];
+      return h_flex().id('job-' + job.id).h(24).px(8).gap(8).items_center().rounded(5).flex_none()
         .when(Boolean(job.error), el => el.tooltip(job.error))
         .child(div().w(14).text_color(t.dim).child(job.kind === 'upload' ? '↑' : '↓'))
-        .child(div().text_color(job.dir ? t.accent : t.muted).child(icon(job.dir ? 'folder' : 'file')))
+        .child(div().text_color(job.dir ? t.accent : t.muted).child(icon(job.dir ? 'folder' : 'file', 14)))
         .child(div().flex_1().min_w(0).truncate().child(job.name))
         .child(div().w(72).text_right().text_color(t.muted).child(sizeText(job.size)))
         .child(div().w(150).text_right().truncate().text_color(color[job.status]).child(job.error && job.status !== 'skipped' ? `${label}: ${job.error}` : label))
-        .child(div().w(28).flex_none().when(job.status === 'queued' || running, el => el.child(
-          this.button(t, 'jc-' + job.id, '', cx => this.rpc({ action: 'cancel_job', id: job.id }, cx), { glyph: icon('close'), tip: 'Cancel' })))
+        .child(div().w(24).flex_none().when(job.status === 'queued' || now, el => el.child(
+          this.button(t, 'jc-' + job.id, '', cx => this.rpc({ action: 'cancel_job', id: job.id }, cx), { glyph: icon('close', 13), tip: 'Cancel' })))
           .when(job.status === 'failed' || job.status === 'cancelled', el => el.child(
-            this.button(t, 'jr-' + job.id, '', cx => this.rpc({ action: 'retry', id: job.id }, cx), { glyph: icon('refresh'), tip: 'Retry' }))));
+            this.button(t, 'jr-' + job.id, '', cx => this.rpc({ action: 'retry', id: job.id }, cx), { glyph: icon('refresh', 13), tip: 'Retry' }))));
     };
+    const fold = cx => { this.queueOpen = !this.queueOpen; save('queueOpen', this.queueOpen); cx.notify(); };
     return v_flex().flex_none().border_t_1().border_color(t.border)
-      .child(h_flex().px(12).h(40).gap(10).items_center()
-        .child(this.button(t, 'queue-fold', '', cx => { this.queueOpen = !this.queueOpen; save('queueOpen', this.queueOpen); cx.notify(); },
-          { glyph: icon(this.queueOpen ? 'chevron-down' : 'chevron-right'), tip: this.queueOpen ? 'Hide the queue' : 'Show the queue' }))
-        .child(div().max_w(380).truncate().text_color(t.foreground).child(summary))
-        .child(div().flex_1().min_w(60).h(6).rounded(3).bg(t.border).child(div().h_full().rounded(3).bg(t.accent).w(`${pct.toFixed(1)}%`)))
-        .child(div().w(160).text_right().truncate().text_color(t.dim).child(x && x.rate
-          ? `${sizeText(x.rate)}/s${n.bytes > n.moved ? ' · ' + duration((n.bytes - n.moved) / x.rate) : ''}` : ''))
-        .when(Boolean(n.waiting || n.folders), el => el.child(this.button(t, 'cancel-all', 'Cancel all', cx => this.rpc({ action: 'cancel_all' }, cx))))
-        .when(Boolean(problems), el => el.child(this.button(t, 'retry-all', 'Retry', cx => this.rpc({ action: 'retry' }, cx))))
-        .when(Boolean(finished), el => el.child(this.button(t, 'clear', 'Clear', cx => this.rpc({ action: 'clear' }, cx),
-          { tip: 'Remove finished items from the list' }))))
-      .when(Boolean(this.queueOpen), el => el.child(v_flex().id('queue-list').h(170).px(10).pb(8).overflow_y_scrollbar()
+      .child(h_flex().id('queue-head').px(8).h(30).gap(8).items_center().hover(s => s.bg(t.hover))
+        .tooltip(`${n.done + n.skipped} of ${n.files} files · ${sizeText(n.moved)} of ${sizeText(n.bytes)}`)
+        .on_click((_e, cx) => fold(cx))
+        .child(div().text_color(t.dim).child(icon(this.queueOpen ? 'chevron-down' : 'chevron-right', 14)))
+        .child(div().max_w(320).min_w(0).truncate().text_color(problems && !working ? t.ansi1 : t.foreground).child(headline))
+        .when(waiting > 0, el => el.child(div().flex_none().text_color(t.dim).child(`${waiting} queued`)))
+        .child(div().flex_1().min_w(40).h(5).rounded(3).bg(t.border).child(div().h_full().rounded(3).bg(problems ? t.blocked : t.accent).w(`${pct.toFixed(1)}%`)))
+        .when(Boolean(x && x.rate), el => el.child(div().flex_none().text_color(t.dim)
+          .child(`${sizeText(x.rate)}/s${n.bytes > n.moved ? ' · ' + duration((n.bytes - n.moved) / x.rate) : ''}`)))
+        .when(working, el => el.child(this.button(t, 'cancel-all', 'Cancel all', cx => this.rpc({ action: 'cancel_all' }, cx), { h: 22 })))
+        .when(Boolean(problems), el => el.child(this.button(t, 'retry-all', 'Retry', cx => this.rpc({ action: 'retry' }, cx), { h: 22 })))
+        .when(Boolean(finished && (problems || working)), el => el.child(this.button(t, 'clear', 'Clear', cx => this.rpc({ action: 'clear' }, cx),
+          { tip: 'Remove finished items', h: 22 }))))
+      .when(Boolean(this.queueOpen), el => el.child(v_flex().id('queue-list').h((this.height ?? 600) < 420 ? 96 : 150).px(6).pb(6).overflow_y_scrollbar()
         .children(rows.map(row))
         .when(jobs.length > rows.length, el => el.child(div().px(8).py(4).text_color(t.dim).child(`and ${jobs.length - rows.length} more…`)))));
   }
 
-  render(cx) {
-    const t = theme(), s = this.state;
+  // SSH | Split | SFTP, for the host tab this pane belongs to.
+  modeSwitch(t, cx) {
+    const state = tabState(this.tab);
+    if (!state) return null;
+    const seg = (id, label, iconName, tip) => {
+      const on = state.mode === id;
+      return h_flex().id(`sftp-mode-${id}`).h(22).px(this.width < 700 ? 5 : 7).gap(4).items_center().rounded(4).flex_none()
+        .bg(on ? t.selected : '#00000000').text_color(on ? t.foreground : t.muted)
+        .hover(s => s.bg(on ? t.selected : t.hover).text_color(t.foreground))
+        .tooltip(tip).accessibility_label(tip)
+        .on_click((_e, cx) => setMode(id, tabState(this.tab), cx))
+        .child(icon(iconName, 12)).when(this.width >= 700, el => el.child(label));
+    };
+    return h_flex().flex_none().p(1).gap(1).items_center().rounded(6).border_1().border_color(t.border)
+      .child(seg('ssh', 'SSH', 'terminal', 'SSH only (SFTP keeps running)'))
+      .child(seg('split', 'Split', 'split', 'SSH on top, SFTP below'))
+      .child(seg('sftp', 'SFTP', 'sftp', 'SFTP only (SSH keeps running)'));
+  }
+
+  // The one toolbar: status and summary, actions, and the mode switch.
+  toolbar(t, cx) {
+    const s = this.state;
     const local = this.panels.local.selection, remote = this.panels.remote.selection;
     const many = (list, one) => list.length > 1 ? `${list.length} items` : list.length ? `“${list[0].name}”` : one;
-    const conflict = s.conflict;
-    const modal = s.prompt ? this.promptCard(t, s.prompt) : conflict ? this.conflictCard(t, conflict) : this.viewer ? this.viewerCard(t) : this.form ? this.formCard(t) : null;
-    const error = this.error || (s.error && s.error !== this.dismissedError ? s.error : null);
+    const activePanel = this.panels[this.active];
+    const chosen = activePanel.entry, picked = activePanel.selection, usable = this.usable(this.active);
     const connecting = this.starting || (this.conn && !s.ready && s.busy);
-    const chosen = this.panels[this.active].entry, picked = this.panels[this.active].selection, usable = this.usable(this.active);
-    const panelWidth = (this.width - 36) / 2;
+    const error = this.error || (s.error && s.error !== this.dismissedError ? s.error : null);
+    const where = this.active === 'local' ? 'this computer' : this.alias;
 
-    const toolbar = h_flex().px(12).h(48).flex_none().gap(6).items_center().border_b_1().border_color(t.border)
-      .child(this.button(t, 'upload', local.length > 1 ? `Upload ${local.length} →` : 'Upload →', cx => this.transfer('local', cx),
-        { active: this.canTransfer && local.length > 0, tip: local.length ? `Upload ${many(local)} to ${s.path} (F5)` : 'Choose files or folders on This computer' }))
-      .child(this.button(t, 'download', remote.length > 1 ? `← Download ${remote.length}` : '← Download', cx => this.transfer('remote', cx),
-        { active: this.canTransfer && remote.length > 0, tip: remote.length ? `Download ${many(remote)} to ${s.local_path} (F5)` : `Choose files or folders on ${this.alias}` }))
-      .child(div().w(1).h(20).mx(4).bg(t.border))
-      .child(this.button(t, 'mkdir', 'New folder', cx => this.showForm('mkdir', cx), { active: usable, tip: 'New folder (F7)' }))
-      .child(this.button(t, 'rename', 'Rename', cx => this.showForm('rename', cx), { active: usable && Boolean(chosen), tip: 'Rename (F2)' }))
-      .child(this.button(t, 'delete', picked.length > 1 ? `Delete ${picked.length}` : 'Delete', cx => this.showForm('delete', cx),
-        { active: usable && picked.length > 0, danger: true, tip: 'Delete (Del)' }))
-      .child(div().flex_1())
-      .child(div().text_color(s.ready ? t.done : t.dim).child(s.ready ? 'connected' : connecting ? 'connecting…' : 'not connected'))
-      .child(this.button(t, 'connection', s.ready || connecting ? 'Disconnect' : this.conn ? 'Reconnect' : 'Connect',
-        cx => (s.ready || connecting) ? this.disconnect(cx) : this.reconnect(cx), { active: !this.starting, primary: !s.ready && !connecting }));
+    // Status: a dot (spinner while connecting) and the alias; a click connects or disconnects.
+    const dot = connecting
+      ? div().text_size(11).text_color(t.accent).child(SPINNER[0]).frames(SPINNER, 90)
+      : div().w(7).h(7).flex_none().rounded_full()
+        .bg(s.prompt || s.conflict ? t.blocked : s.ready ? t.done : error ? t.ansi1 : t.dim);
+    const statusTip = s.prompt ? 'Waiting for the sign-in dialog'
+      : s.ready ? `Connected to ${this.alias}${this.target ? ' (' + this.target + ')' : ''} · click to disconnect`
+      : connecting ? `Connecting to ${this.alias}…` : `Not connected · click to connect`;
+    const status = h_flex().id('sftp-status').h(26).px(6).gap(6).items_center().rounded(5).flex_none().min_w(0)
+      .hover(s => s.bg(t.hover)).tooltip(statusTip).accessibility_label(statusTip)
+      .on_click((_e, cx) => { if (this.starting) return; if (s.ready || connecting) this.disconnect(cx); else this.reconnect(cx); })
+      .child(dot)
+      .child(div().max_w(140).truncate().font_semibold().child(this.alias || 'SFTP'))
+      .when(Boolean(this.target) && this.width > 900, el => el.child(div().max_w(180).truncate().text_color(t.dim).child(this.target)));
+
+    // Summary: an error first, then the last message, then the selection.
+    const marked = activePanel.marked.size;
+    const msg = s.message && s.message !== 'Connected' ? s.message : null;
+    const summary = error ? String(error).split('\n')[0]
+      : msg || (marked > 1 ? `${marked} selected · ${sizeText(picked.reduce((sum, e) => sum + (e.dir ? 0 : e.size ?? 0), 0)) || '0 B'}`
+        : chosen ? `${chosen.name}${chosen.dir ? '' : ' · ' + sizeText(chosen.size)}` : '');
+
+    const tool = (id, glyph, fn, tip, active, danger = false) => this.button(t, id, '', fn,
+      { glyph, tip, active, danger, h: 26 });
+    return h_flex().px(8).h(38).flex_none().gap(4).items_center().border_b_1().border_color(t.border)
+      .child(status)
+      .when(Boolean(summary) && this.width > 560, el => el.child(h_flex().min_w(0).flex_shrink(1).gap(4).items_center()
+        .child(div().text_color(t.border).child('·'))
+        .child(div().min_w(0).truncate().text_size(11).text_color(error ? t.ansi1 : t.muted).tooltip(error ? String(error) : summary).child(summary))
+        .when(Boolean(error), el => el.child(this.button(t, 'error-close', '', cx => { this.error = null; this.dismissedError = s.error; cx.notify(); },
+          { glyph: icon('close', 12), tip: 'Hide', h: 20 })))))
+      .child(div().flex_1().min_w(8))
+      .child(tool('upload', div().child('↑'), cx => this.transfer('local', cx),
+        local.length ? `Upload ${many(local)} to ${s.path} (F5)` : 'Upload: choose files or folders on the left', this.canTransfer && local.length > 0))
+      .child(tool('download', div().child('↓'), cx => this.transfer('remote', cx),
+        remote.length ? `Download ${many(remote)} to ${s.local_path} (F5)` : `Download: choose files or folders on ${this.alias}`, this.canTransfer && remote.length > 0))
+      .child(tool('refresh', icon('refresh', 14), cx => this.list(this.active, '.', cx), `Refresh ${where} (Ctrl+R)`, usable))
+      .child(tool('mkdir', div().child('+'), cx => this.showForm('mkdir', cx), `New folder on ${where} (F7)`, usable))
+      .child(tool('rename', div().child('✎'), cx => this.showForm('rename', cx), 'Rename (F2)', usable && Boolean(chosen)))
+      .child(tool('delete', div().child('✕'), cx => this.showForm('delete', cx),
+        picked.length > 1 ? `Delete ${picked.length} items (Del)` : 'Delete (Del)', usable && picked.length > 0, true))
+      .child(div().flex_1().min_w(8))
+      .when(Boolean(this.tab), el => el.child(this.modeSwitch(t, cx) ?? div()));
+  }
+
+  render(cx) {
+    const t = theme(), s = this.state;
+    const conflict = s.conflict;
+    const modal = conflict ? this.conflictCard(t, conflict) : this.viewer ? this.viewerCard(t) : this.form ? this.formCard(t) : null;
+    const pad = (this.height ?? 600) < 420 ? 4 : 6;
+    const panelWidth = (this.width - pad * 3) / 2;
+    const queue = this.queue(t, cx);
+    const inset = headerInset();
 
     return v_flex().id('sftp-root').size_full().min_h(0).relative().bg(t.chrome).text_color(t.foreground).text_size(12)
       .on_size_change((size, cx) => {
+        const resized = Math.abs(size.width - this.width) > 8 || Math.abs(size.height - (this.height ?? 0)) > 8;
         this.height = size.height;
-        if (Math.abs(size.width - this.width) > 8) { this.width = size.width; cx.notify(); }
+        if (resized) { this.width = size.width; cx.notify(); }
       })
       // A right press bubbles here last: open the menu its row (or list) asked for, where it was pressed.
       .on_mouse_down('right', (e, cx) => {
@@ -872,18 +959,11 @@ export class SftpPanel {
         this.pendingMenu = null;
         cx.notify();
       })
-      .child(toolbar)
-      .when(Boolean(error), el => el.child(h_flex().mx(12).mt(8).px(12).py(8).gap(8).items_start().rounded(6).bg(t.surface)
-        .border_1().border_color(t.ansi1)
-        .child(v_flex().flex_1().min_w(0).gap(4)
-          .child(div().whitespace_normal().text_color(t.ansi1).child(String(error).split('\n')[0]))
-          .when(String(error).includes('\n'), el => el.child(div().whitespace_normal().text_size(11).text_color(t.muted)
-            .font_family(settings().font_family ?? 'JetBrains Mono').child(String(error).split('\n').slice(1, 6).join('\n')))))
-        .child(this.button(t, 'error-close', '', cx => { this.error = null; this.dismissedError = s.error; cx.notify(); },
-          { glyph: icon('close'), tip: 'Hide' }))))
-      .child(h_flex().flex_1().min_h(0).p(12).gap(12).items_stretch()
+      .when(inset > 0, el => el.child(div().h(inset).flex_none()))
+      .child(this.toolbar(t, cx))
+      .child(h_flex().flex_1().min_h(0).p(pad).gap(pad).items_stretch()
         .children(SIDES.map(side => this.panel(t, side, panelWidth))))
-      .child(this.queue(t))
+      .when(Boolean(queue), el => el.child(queue))
       .when(Boolean(this.menu && !modal), el => el.child(this.menuView(t)))
       .when(Boolean(modal), el => el.child(v_flex().id('sftp-modal').absolute().inset_0().items_center().justify_center().p(16)
         .bg(t.canvas).opacity(0.97).on_mouse_down('left', (_e, cx) => cx.stop_propagation()).child(modal)));
@@ -892,9 +972,13 @@ export class SftpPanel {
   async close() {
     this.closed = true;
     this.generation++;
+    if (this.dialog) { closeOverlay(this.dialog); this.dialog = null; }
+    if (this.tab) {
+      const all = { ...(shared('ssh-hosts.sftp.live') ?? {}) };
+      if (this.tab in all) { delete all[this.tab]; setShared('ssh-hosts.sftp.live', all); }
+    }
     for (const panel of Object.values(this.panels)) panel.release();
     this.name.release();
-    this.secret.release();
     if (this.conn) await this.post({ action: 'close' }).catch(() => {});
   }
 }

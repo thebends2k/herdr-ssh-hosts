@@ -1,1 +1,5 @@
-{"place":"none","title":"SSH"}
+{
+  "place": "none",
+  "title": "SSH",
+  "overlay": { "kind": "popup", "at": "top", "offset": 40, "width": 360, "height": 420 }
+}
