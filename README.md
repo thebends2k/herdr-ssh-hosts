@@ -44,6 +44,12 @@ Then merge [`keys.json`](keys.json) into `~/.config/herdr-app/keys.json` (ask be
 
 That is all it needs: **Ctrl+Shift+H** opens the picker, and every host tab carries its own SSH / Split / SFTP switch. No layout changes are required.
 
+The switch lives in the SFTP toolbar, so the **SSH** view (the terminal at full size) hides it. Ways back to Split or SFTP:
+
+- the **floating pill** (see below), recommended: it stays on screen in every view;
+- the **unzoom** button in the pane header, in layouts that draw one (Herdr's `main` and `terminals` do);
+- the `pane.zoom` key, **Ctrl+Shift+Z** with Herdr's default keys (check `pane.zoom` in your `keys.json`).
+
 ## Optional: in a layout of your own
 
 Herdr's shipped layouts are read-only, so clone one first: `herdr-app do layout.clone '{"name":"main","as":"my-layout"}'`.
@@ -62,12 +68,17 @@ Herdr's shipped layouts are read-only, so clone one first: `herdr-app do layout.
 
   A tab bar button shows it with `layout.select {stack: "panel-body", child: "ssh"}` + `layout.show {id: "panel"}`, as it does for Files.
 
-- **Floating pill** (status + SSH / Split / SFTP), on the block that shows the tab (`"tab": "active"`). It only draws on host tabs and can be dragged:
+- **Floating pill** (status + SSH / Split / SFTP), recommended: the only switch that stays on screen in the SSH view. It only draws on host tabs and can be dragged. `floating` is a property of the block whose `content` is `{ "tab": "active" }`, next to `content`, not inside it. If that block already has a `floating` list, add the item to it and keep the others. In a clone of `main` the block is `main`:
 
   ```json
-  "floating": [
-    { "id": "ssh-bar", "content": { "mod": "ssh-hosts", "props": { "bar": true } }, "edge": "bottom", "align": "end" }
-  ]
+  {
+    "id": "main",
+    "type": "block",
+    "content": { "tab": "active" },
+    "floating": [
+      { "id": "ssh-bar", "content": { "mod": "ssh-hosts", "props": { "bar": true } }, "edge": "bottom", "align": "end" }
+    ]
+  }
   ```
 
 - **Button in a tab bar mod of your own** (a clone of `tabs`), for example before Files:

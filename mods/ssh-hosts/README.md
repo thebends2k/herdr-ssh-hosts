@@ -18,11 +18,16 @@ of the SFTP toolbar or from the floating pill:
 Closing one of the two panes leaves the other alone. The switch brings the
 missing one back, without signing in again while the connection lives.
 
-The **floating pill** (`props: { bar: true }`, optional, see the repository's
-README) only draws on host tabs. It shows the SFTP status (a green dot when
-connected, a spinner while connecting, amber when a sign-in dialog or a file
-conflict waits, red when it is not connected, `↑ 42%` while transferring) and
-the same three views. Drag it anywhere; it settles on the nearest edge.
+The toolbar's switch is hidden with the SFTP pane in the **SSH** view. To come
+back, use the floating pill, the **unzoom** button of the pane header (in
+layouts that draw one, such as Herdr's `main` and `terminals`), or `pane.zoom`
+(**Ctrl+Shift+Z** with Herdr's default keys).
+
+The **floating pill** (`props: { bar: true }`, optional but recommended, see
+the repository's README) only draws on host tabs. It shows the SFTP status (a
+green dot when connected, a spinner while connecting, amber when a sign-in
+dialog or a file conflict waits, red when it is not connected, `↑ 42%` while
+transferring) and the same three views. Drag it anywhere; it settles on the nearest edge.
 
 ## Signing in once
 
