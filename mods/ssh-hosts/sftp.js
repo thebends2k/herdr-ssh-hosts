@@ -216,6 +216,7 @@ export class SftpPanel {
     this.starting = true;
     this.answeredSecret = null;
     this.error = null;
+    this.lost = false;
     this.state = { ...EMPTY };
     this.panels.remote.entries = [];
     const start = load('path:' + this.alias, '.');
@@ -265,8 +266,11 @@ export class SftpPanel {
           if (++failures >= 3) {
             this.conn = null;
             this.state = { ...this.state, ready: false, busy: false, transfer: null, prompt: null };
+            // As after a disconnect: the lists were the helper's, and the message goes where they were.
+            for (const panel of Object.values(this.panels)) { panel.entries = []; panel.reset(); }
             this.askInDialog(null);
-            this.error = 'Lost the connection to the SFTP browser. Press Connect to retry.';
+            this.lost = true;
+            this.error = 'The SFTP browser stopped answering.';
             this.publishStatus();
           }
         }
@@ -355,6 +359,7 @@ export class SftpPanel {
     this.viewer = null;
     this.form = null;
     this.error = null;
+    this.lost = false;
     this.publishStatus();
     if (conn) cx.spawn(async () => { await this.post({ action: 'close' }, conn).catch(() => {}); });
     cx.notify();
@@ -707,6 +712,11 @@ export class SftpPanel {
     if (!this.conn) {
       if (this.starting) return block('Starting…', '', null, true);
       if (remote) return null;  // the local panel explains it
+      // Disconnected on purpose (or the error was hidden): not a failure.
+      if (!this.error) return block(`Disconnected from ${this.alias}`, 'Your folders are remembered.',
+        this.button(t, `connect-${side}`, 'Connect', cx => this.connect(cx), { primary: true }));
+      if (this.lost) return block('Connection lost', firstLine(this.error),
+        this.button(t, `reconnect-lost-${side}`, 'Reconnect', cx => this.connect(cx), { primary: true }));
       return block('Could not start the browser', firstLine(this.error),
         this.button(t, `retry-start-${side}`, 'Retry', cx => this.connect(cx), { primary: true }));
     }
