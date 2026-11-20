@@ -75,7 +75,7 @@ Folder `mods/ssh-hosts/`, which is the whole mod, plus `keys.json` at the reposi
 | `jsconfig.json`, `README.md` | Editor settings and the mod's documentation. |
 | `keys.json` (repository root) | `{"global": {"ctrl-shift-h": "mod.open:ssh-hosts"}}`, to merge into the person's. |
 
-**Layout.** None is needed: the key opens the picker and the switch lives in the SFTP toolbar. Optional, in a cloned layout (`herdr-app do layout.clone '{"name":"main","as":"my-layout"}'`): the row `{ "id": "ssh-hosts", "type": "block", "content": { "mod": "ssh-hosts" }, "size": { "px": 32 }, "min": 32, "max": 32 }`, and the pill on the tab block:
+**Layout.** None is needed: the key opens the picker and the switch lives in the SFTP toolbar. That switch is hidden in the SSH view, so the README must say how to come back (the pill, the pane header's unzoom button, or `pane.zoom`, Ctrl+Shift+Z by default) and recommend the pill. Optional, in a cloned layout (`herdr-app do layout.clone '{"name":"main","as":"my-layout"}'`): the row `{ "id": "ssh-hosts", "type": "block", "content": { "mod": "ssh-hosts" }, "size": { "px": 32 }, "min": 32, "max": 32 }`, and the pill on the tab block (the one whose `content` is `{ "tab": "active" }`; `floating` goes next to `content`, added to any list already there):
 
 ```json
 "floating": [
