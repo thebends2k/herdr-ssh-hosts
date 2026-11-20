@@ -60,7 +60,9 @@ A prompt written by the server (keyboard-interactive, which OpenSSH prefixes
 with `(user@host)`) is shown under the title "<alias> asks", never as a key
 passphrase or a fingerprint question. Links inside an uploaded folder are not
 followed (a link to `~/.ssh/id_ed25519` in a cloned project stays here), and a
-download refuses a local destination folder that is a link.
+download refuses a local destination folder that is a link. On Windows,
+directory junctions count as links. A folder swapped for a link while the
+queue runs is refused when its turn comes.
 
 Names that come from the server are checked before anything is written on this
 computer: a name with a slash or backslash, `..`, and on Windows a drive or
@@ -119,8 +121,8 @@ or `<>"|?*` is never downloaded (it shows as skipped, with the reason).
   failed, and **Clear**. When everything finished well the strip goes away
   after 3 seconds; problems stay until cleared. You can keep browsing meanwhile.
 - Folders are walked as they go, so queuing a huge folder is instant. Links to
-  folders are not followed (they could form loops); links to files are
-  transferred as files.
+  folders (Windows junctions included) are not followed (they could form
+  loops); links to files are transferred as files.
 - If a file already exists at the destination, the queue stops and asks, showing
   the size and date of both: **Skip**, **Rename** (saves as “name (2).ext”) or
   **Overwrite**, and optionally the same for the other files of that transfer.
