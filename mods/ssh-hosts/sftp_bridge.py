@@ -319,8 +319,10 @@ class SFTP:
     def upload(self, local, remote, progress, cancelled, overwrite=False, follow=True):
         # Inside an uploaded folder links are not followed: a link to
         # ~/.ssh/id_ed25519 in a cloned project must never reach the server.
-        if not follow and os.path.islink(local):
+        if not follow and is_link(local):
             raise ValueError('Link: not followed')
+        if os.path.isdir(local) and is_link(local):
+            raise ValueError('Link to a folder: not followed')
         if not Path(local).is_file():
             raise ValueError('Choose a local file, not a folder')
         existing = self.exists(remote)
@@ -688,6 +690,25 @@ def local_child(folder, name):
     return path
 
 
+NAME_SURROGATE = 0x20000000  # Windows reparse tags that name another path: symlinks, junctions
+
+
+def is_link(path):
+    """A symbolic link or, on Windows, a junction or any reparse point that
+    names another path. `os.path.islink()` misses junctions, and
+    `os.path.isjunction()` only exists from Python 3.12. Cloud placeholders
+    (OneDrive) are reparse points too, but not name surrogates: still files."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_reparse_tag', 0) & NAME_SURROGATE)
+
+
+def same_path(a, b):
+    return os.path.normcase(os.path.normpath(a)) == os.path.normcase(os.path.normpath(b))
+
+
 # --- this computer's files (the local panel) -----------------------------
 
 DRIVES = ''  # the local path that lists Windows drives
@@ -723,7 +744,7 @@ def local_listing(path):
                 info = item.stat(follow_symlinks=True)
             except OSError:
                 info = item.stat(follow_symlinks=False)  # a broken link
-            link = item.is_symlink()
+            link = item.is_symlink() or (os.name == 'nt' and is_link(item.path))
             hidden = item.name.startswith('.') or bool(getattr(info, 'st_file_attributes', 0) & 2)
             folder = stat.S_ISDIR(info.st_mode)
             entries.append(dict(name=item.name, dir=folder, link=link, hidden=hidden,
@@ -1228,6 +1249,7 @@ class Worker:
                     job['dst'] = destination
                     job['renamed'] = (posixpath if upload else os.path).basename(destination)
             overwrite = choice == 'overwrite'
+        self.stay_inside(job)  # again: the conflict question can wait for minutes
         if upload:
             client.upload(job['src'], destination, self.progress(), self.cancel.is_set, overwrite,
                           follow='/' not in job['name'])  # what the person chose; not what a folder holds
@@ -1235,10 +1257,35 @@ class Worker:
             client.download(job['src'], destination, self.progress(), self.cancel.is_set, overwrite)
         return 'done'
 
+    def stay_inside(self, job):
+        """Inside a transferred folder, the local side must still be where it
+        was queued. A link or a junction swapped in for one of its folders
+        after queuing would point the job somewhere else: compare the real
+        path of the item's folder with the real path of the folder the person
+        chose plus the names in between. The item itself is checked where it
+        is opened (O_NOFOLLOW, `is_link`).
+        Uploading, the person chose the top folder itself; downloading, they
+        chose the local folder it goes into, and the top folder is ours."""
+        parts = job['name'].split('/')
+        if len(parts) < 2:
+            return  # what the person chose
+        upload = job['kind'] == 'upload'
+        local = job['src'] if upload else job['dst']
+        between = parts[1:-1] if upload else parts[:-1]
+        root = os.path.dirname(local)
+        for _ in between:
+            root = os.path.dirname(root)
+        expected = os.path.join(os.path.realpath(root), *between)
+        if not same_path(os.path.realpath(os.path.dirname(local)), expected):
+            raise ValueError('A folder on the way is now a link: not followed')
+
     def expand(self, job):
         """A folder: make it on the other side and queue what it holds behind it."""
         client, upload, children = self.client, job['kind'] == 'upload', []
+        self.stay_inside(job)
         if upload:
+            if '/' in job['name'] and is_link(job['src']):
+                raise ValueError('Link: not followed')
             existing = client.exists(job['dst'])
             if existing is None:
                 client.request(MKDIR, string(job['dst']) + u32(0))
@@ -1246,8 +1293,10 @@ class Worker:
                 raise ValueError('A file with that name already exists on the server')
             with os.scandir(job['src']) as items:
                 for item in sorted(items, key=lambda i: (not i.is_dir(), i.name.casefold())):
-                    link_dir = item.is_symlink()  # never followed, to a folder or to a file
-                    folder = item.is_dir(follow_symlinks=False)
+                    # Never followed, to a folder or to a file; on Windows a
+                    # junction is a folder for is_dir() but a link here.
+                    link_dir = item.is_symlink() or (os.name == 'nt' and is_link(item.path))
+                    folder = item.is_dir(follow_symlinks=False) and not link_dir
                     try:
                         size = None if folder or link_dir else item.stat().st_size
                     except OSError:
@@ -1255,7 +1304,7 @@ class Worker:
                     children.append((item.name, item.path, posixpath.join(job['dst'], item.name), folder, link_dir, size))
         else:
             if os.path.lexists(job['dst']):
-                if os.path.islink(job['dst']):
+                if is_link(job['dst']):
                     raise ValueError('The local destination is a link: it is not followed')
                 if not os.path.isdir(job['dst']):
                     raise ValueError('A file with that name already exists on this computer')
